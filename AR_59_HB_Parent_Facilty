@@ -1,0 +1,1525 @@
+USE [RCA_Code];
+GO
+
+SET NOCOUNT ON;
+SET XACT_ABORT ON;
+
+
+/*==============================================================
+
+ HB AR059 RECOVERY DETAIL
+
+ HB hierarchy:
+
+ Corporate
+     Region
+         Parent Facility / Source Facility
+             SubFacility
+
+ This version:
+
+ 1. Loads all HB SubFacilities from RCA_Data.Analysis.dimFacility.
+ 2. Retains Region, Parent Facility, and SubFacility.
+ 3. Passes SubFacility IDs to the HB AR059 procedure.
+ 4. Includes both Inpatient and Outpatient.
+ 5. Runs the AR059 procedure for six ranges.
+ 6. Returns summaries and complete transaction detail.
+ 7. Uses Parent Facility as the primary requested grouping.
+
+==============================================================*/
+
+
+------------------------------------------------------------
+-- 1) GENERAL SETTINGS
+------------------------------------------------------------
+
+DECLARE @Username VARCHAR(50) = 'BHCS\vstevens';
+
+DECLARE @InOutTypes VARCHAR(50) = 'Inpatient,Outpatient';
+
+DECLARE @RAC INT = 1;
+
+DECLARE @ExcludeAccounts INT = 0;
+
+DECLARE @Status VARCHAR(20) = 'BAD DEBT,INACTIVE';
+
+DECLARE @PayorType VARCHAR(31) = 'Financial Class';
+
+/*
+NULL means all financial classes/payors.
+*/
+DECLARE @PayorCodes VARCHAR(MAX) = NULL;
+
+DECLARE @SystemType VARCHAR(MAX) = NULL;
+
+DECLARE @UDFilter1 VARCHAR(MAX) = NULL;
+
+DECLARE @DaysThreshold INT = 30;
+
+DECLARE @AuthMode VARCHAR(10) = 'AD';
+
+
+------------------------------------------------------------
+-- 2) SIX RECOVERY RANGES
+--
+-- AnalysisPeriodID:
+-- Analysis Date selected in Crowe
+--
+-- ActivityThroughPeriodID:
+-- Activity Through date selected in Crowe
+------------------------------------------------------------
+
+DECLARE @Ranges TABLE
+(
+    RangeOrder INT NOT NULL PRIMARY KEY,
+    RangeLabel VARCHAR(100) NOT NULL,
+    AnalysisPeriodID INT NOT NULL,
+    ActivityThroughPeriodID INT NOT NULL
+);
+
+INSERT INTO @Ranges
+(
+    RangeOrder,
+    RangeLabel,
+    AnalysisPeriodID,
+    ActivityThroughPeriodID
+)
+VALUES
+    (1, 'Range 1', 20250731, 20260731),
+    (2, 'Range 2', 20250630, 20260630),
+    (3, 'Range 3', 20250531, 20260531),
+    (4, 'Range 4', 20250430, 20260430),
+    (5, 'Range 5', 20250331, 20260331),
+    (6, 'Range 6', 20250831, 20260831);
+
+
+------------------------------------------------------------
+-- 3) VALIDATE RANGE DATES
+------------------------------------------------------------
+
+IF EXISTS
+(
+    SELECT 1
+    FROM @Ranges
+    WHERE AnalysisPeriodID >= ActivityThroughPeriodID
+)
+BEGIN
+    THROW 50001,
+        'Each Analysis Period must be earlier than its Activity Through Period.',
+        1;
+END;
+
+
+------------------------------------------------------------
+-- 4) CREATE HB FACILITY HIERARCHY
+--
+-- df:
+-- Lowest-level SubFacility passed into AR059
+--
+-- sourceFac:
+-- Parent Facility shown in the HB facility selector
+--
+-- region:
+-- Region such as Central or Northern
+------------------------------------------------------------
+
+IF OBJECT_ID('tempdb..#HBFacilityHierarchy') IS NOT NULL
+    DROP TABLE #HBFacilityHierarchy;
+
+CREATE TABLE #HBFacilityHierarchy
+(
+    RegionID INT NULL,
+    RegionCode VARCHAR(100) NULL,
+    Region VARCHAR(255) NULL,
+    RegionLevelType VARCHAR(100) NULL,
+
+    ParentFacilityID INT NULL,
+    ParentFacilityCode VARCHAR(100) NULL,
+    ParentFacility VARCHAR(255) NULL,
+    ParentFacilityLevelType VARCHAR(100) NULL,
+
+    SubFacilityID INT NOT NULL,
+    SubFacilityCode VARCHAR(100) NULL,
+    SubFacility VARCHAR(255) NULL,
+    SubFacilityLevelType VARCHAR(100) NULL
+);
+
+INSERT INTO #HBFacilityHierarchy
+(
+    RegionID,
+    RegionCode,
+    Region,
+    RegionLevelType,
+
+    ParentFacilityID,
+    ParentFacilityCode,
+    ParentFacility,
+    ParentFacilityLevelType,
+
+    SubFacilityID,
+    SubFacilityCode,
+    SubFacility,
+    SubFacilityLevelType
+)
+SELECT DISTINCT
+    region.FacilityID AS RegionID,
+    region.FacilityCode AS RegionCode,
+    LTRIM(RTRIM(region.FacilityName)) AS Region,
+    region.FacilityLevelType AS RegionLevelType,
+
+    sourceFac.FacilityID AS ParentFacilityID,
+    sourceFac.FacilityCode AS ParentFacilityCode,
+    LTRIM(RTRIM(sourceFac.FacilityName)) AS ParentFacility,
+    sourceFac.FacilityLevelType AS ParentFacilityLevelType,
+
+    df.FacilityID AS SubFacilityID,
+    df.FacilityCode AS SubFacilityCode,
+    LTRIM(RTRIM(df.FacilityName)) AS SubFacility,
+    df.FacilityLevelType AS SubFacilityLevelType
+
+FROM RCA_Data.Analysis.dimFacility AS df
+
+INNER JOIN RCA_Data.Analysis.dimFacility AS sourceFac
+    ON df.ParentFacilityID = sourceFac.FacilityID
+
+INNER JOIN RCA_Data.Analysis.dimFacility AS region
+    ON sourceFac.ParentFacilityID = region.FacilityID
+
+WHERE df.FacilityLevelType = 'Subfacility'
+  AND df.FacilityID IS NOT NULL;
+
+
+------------------------------------------------------------
+-- 5) VERIFY HB FACILITY HIERARCHY
+------------------------------------------------------------
+
+IF NOT EXISTS
+(
+    SELECT 1
+    FROM #HBFacilityHierarchy
+)
+BEGIN
+    THROW 50002,
+        'No HB SubFacilities were found in RCA_Data.Analysis.dimFacility.',
+        1;
+END;
+
+
+------------------------------------------------------------
+-- 6) CREATE ONE MAPPING ROW PER SUBFACILITY
+--
+-- This prevents transaction duplication if dimFacility
+-- contains more than one hierarchy row for a SubFacility.
+------------------------------------------------------------
+
+IF OBJECT_ID('tempdb..#HBFacilityMapping') IS NOT NULL
+    DROP TABLE #HBFacilityMapping;
+
+CREATE TABLE #HBFacilityMapping
+(
+    RegionID INT NULL,
+    RegionCode VARCHAR(100) NULL,
+    Region VARCHAR(255) NULL,
+
+    ParentFacilityID INT NULL,
+    ParentFacilityCode VARCHAR(100) NULL,
+    ParentFacility VARCHAR(255) NULL,
+
+    SubFacilityID INT NOT NULL,
+    SubFacilityCode VARCHAR(100) NULL,
+    SubFacility VARCHAR(255) NULL
+);
+
+;WITH RankedFacilityMapping AS
+(
+    SELECT
+        H.RegionID,
+        H.RegionCode,
+        H.Region,
+
+        H.ParentFacilityID,
+        H.ParentFacilityCode,
+        H.ParentFacility,
+
+        H.SubFacilityID,
+        H.SubFacilityCode,
+        H.SubFacility,
+
+        ROW_NUMBER() OVER
+        (
+            PARTITION BY H.SubFacilityID
+            ORDER BY
+                CASE
+                    WHEN H.Region IS NULL THEN 1
+                    ELSE 0
+                END,
+                H.Region,
+                CASE
+                    WHEN H.ParentFacility IS NULL THEN 1
+                    ELSE 0
+                END,
+                H.ParentFacility,
+                H.SubFacility
+        ) AS MappingRow
+
+    FROM #HBFacilityHierarchy AS H
+)
+INSERT INTO #HBFacilityMapping
+(
+    RegionID,
+    RegionCode,
+    Region,
+
+    ParentFacilityID,
+    ParentFacilityCode,
+    ParentFacility,
+
+    SubFacilityID,
+    SubFacilityCode,
+    SubFacility
+)
+SELECT
+    RegionID,
+    RegionCode,
+    Region,
+
+    ParentFacilityID,
+    ParentFacilityCode,
+    ParentFacility,
+
+    SubFacilityID,
+    SubFacilityCode,
+    SubFacility
+FROM RankedFacilityMapping
+WHERE MappingRow = 1;
+
+
+------------------------------------------------------------
+-- 7) BUILD COMMA-SEPARATED SUBFACILITY LIST
+------------------------------------------------------------
+
+DECLARE @FacilityIDs VARCHAR(MAX);
+
+DECLARE @SubFacilityCount INT;
+
+DECLARE @ParentFacilityCount INT;
+
+DECLARE @RegionCount INT;
+
+SELECT
+    @FacilityIDs =
+        STUFF
+        (
+            (
+                SELECT
+                    ',' + CAST(F.SubFacilityID AS VARCHAR(20))
+                FROM
+                (
+                    SELECT DISTINCT
+                        SubFacilityID
+                    FROM #HBFacilityMapping
+                ) AS F
+                ORDER BY
+                    F.SubFacilityID
+                FOR XML PATH(''), TYPE
+            ).value('.', 'VARCHAR(MAX)'),
+            1,
+            1,
+            ''
+        );
+
+SELECT
+    @SubFacilityCount =
+        COUNT(DISTINCT SubFacilityID),
+
+    @ParentFacilityCount =
+        COUNT
+        (
+            DISTINCT CASE
+                WHEN ParentFacilityID IS NOT NULL
+                THEN ParentFacilityID
+            END
+        ),
+
+    @RegionCount =
+        COUNT
+        (
+            DISTINCT CASE
+                WHEN RegionID IS NOT NULL
+                THEN RegionID
+            END
+        )
+FROM #HBFacilityMapping;
+
+IF NULLIF(LTRIM(RTRIM(@FacilityIDs)), '') IS NULL
+BEGIN
+    THROW 50003,
+        'The HB SubFacilityID list is empty.',
+        1;
+END;
+
+
+------------------------------------------------------------
+-- 8) FACILITY HIERARCHY VALIDATION
+--
+-- Check this result before relying on the recovery summaries.
+------------------------------------------------------------
+
+SELECT
+    RegionID,
+    RegionCode,
+    Region,
+
+    ParentFacilityID,
+    ParentFacilityCode,
+    ParentFacility,
+
+    SubFacilityID,
+    SubFacilityCode,
+    SubFacility
+
+FROM #HBFacilityMapping
+
+ORDER BY
+    Region,
+    ParentFacility,
+    SubFacility,
+    SubFacilityID;
+
+
+------------------------------------------------------------
+-- 9) FACILITY COUNTS BY REGION AND PARENT FACILITY
+------------------------------------------------------------
+
+SELECT
+    RegionID,
+    Region,
+
+    ParentFacilityID,
+    ParentFacility,
+
+    COUNT(DISTINCT SubFacilityID) AS SubFacilityCount
+
+FROM #HBFacilityMapping
+
+GROUP BY
+    RegionID,
+    Region,
+    ParentFacilityID,
+    ParentFacility
+
+ORDER BY
+    Region,
+    ParentFacility;
+
+
+------------------------------------------------------------
+-- 10) OVERALL FACILITY SELECTION INFORMATION
+------------------------------------------------------------
+
+SELECT
+    'All HB' AS ProcessingScope,
+    @RegionCount AS RegionCount,
+    @ParentFacilityCount AS ParentFacilityCount,
+    @SubFacilityCount AS SubFacilityCount,
+    @FacilityIDs AS SubFacilityIDList;
+
+
+------------------------------------------------------------
+-- 11) CREATE AR059 STAGING TABLE
+--
+-- This is based on the PB AR059 return structure.
+--
+-- It must match the columns returned by:
+--
+-- RCA_Code.Analysis.
+-- pr_AR059_BadDebtAndInactiveAccountRecoveryPayments
+------------------------------------------------------------
+
+IF OBJECT_ID('tempdb..#AR059Stage') IS NOT NULL
+    DROP TABLE #AR059Stage;
+
+CREATE TABLE #AR059Stage
+(
+    FacilityID INT,
+    FacilityName VARCHAR(256),
+    InOutType VARCHAR(32),
+    AccountNumber VARCHAR(256),
+    SIPGCode VARCHAR(50),
+    SIPGName VARCHAR(256),
+    FCCode VARCHAR(50),
+    FCName VARCHAR(256),
+    IPCode VARCHAR(50),
+    IPName VARCHAR(256),
+    PostingDate DATETIME,
+    BillingType VARCHAR(50),
+    AdmissionDate DATETIME,
+    DischargeDate DATETIME,
+    TransactionCode VARCHAR(50),
+    TransactionDescription VARCHAR(256),
+    TransactionAmount MONEY,
+    [Status] VARCHAR(20),
+    RecoveryTakeback VARCHAR(20),
+    DaysFromAdmission INT,
+    IncludeExclude VARCHAR(50),
+    PriorTransaction VARCHAR(50)
+);
+
+
+------------------------------------------------------------
+-- 12) CREATE FINAL SIX-RANGE HB DETAIL TABLE
+------------------------------------------------------------
+
+IF OBJECT_ID('tempdb..#AR059HBDetail') IS NOT NULL
+    DROP TABLE #AR059HBDetail;
+
+CREATE TABLE #AR059HBDetail
+(
+    RangeOrder INT,
+    RangeLabel VARCHAR(100),
+    AnalysisPeriodID INT,
+    ActivityThroughPeriodID INT,
+
+    RegionID INT NULL,
+    RegionCode VARCHAR(100) NULL,
+    Region VARCHAR(255) NULL,
+
+    ParentFacilityID INT NULL,
+    ParentFacilityCode VARCHAR(100) NULL,
+    ParentFacility VARCHAR(255) NULL,
+
+    MappedSubFacilityID INT NULL,
+    MappedSubFacilityCode VARCHAR(100) NULL,
+    MappedSubFacility VARCHAR(255) NULL,
+
+    FacilityID INT,
+    FacilityName VARCHAR(256),
+
+    InOutType VARCHAR(32),
+    AccountNumber VARCHAR(256),
+
+    SIPGCode VARCHAR(50),
+    SIPGName VARCHAR(256),
+
+    FCCode VARCHAR(50),
+    FCName VARCHAR(256),
+
+    IPCode VARCHAR(50),
+    IPName VARCHAR(256),
+
+    PostingDate DATETIME,
+    BillingType VARCHAR(50),
+    AdmissionDate DATETIME,
+    DischargeDate DATETIME,
+
+    TransactionCode VARCHAR(50),
+    TransactionDescription VARCHAR(256),
+    TransactionAmount MONEY,
+
+    [Status] VARCHAR(20),
+    RecoveryTakeback VARCHAR(20),
+    DaysFromAdmission INT,
+    IncludeExclude VARCHAR(50),
+    PriorTransaction VARCHAR(50)
+);
+
+
+------------------------------------------------------------
+-- 13) CREATE UNMAPPED FACILITY DIAGNOSTIC TABLE
+--
+-- This captures returned FacilityIDs that do not match a
+-- SubFacilityID in the HB hierarchy.
+------------------------------------------------------------
+
+IF OBJECT_ID('tempdb..#AR059UnmappedFacilities') IS NOT NULL
+    DROP TABLE #AR059UnmappedFacilities;
+
+CREATE TABLE #AR059UnmappedFacilities
+(
+    RangeOrder INT,
+    RangeLabel VARCHAR(100),
+    AnalysisPeriodID INT,
+    ActivityThroughPeriodID INT,
+
+    FacilityID INT,
+    FacilityName VARCHAR(256),
+
+    ReturnedRecordCount BIGINT
+);
+
+
+------------------------------------------------------------
+-- 14) CREATE RUN LOG
+------------------------------------------------------------
+
+IF OBJECT_ID('tempdb..#AR059RunLog') IS NOT NULL
+    DROP TABLE #AR059RunLog;
+
+CREATE TABLE #AR059RunLog
+(
+    RangeOrder INT,
+    RangeLabel VARCHAR(100),
+    AnalysisPeriodID INT,
+    ActivityThroughPeriodID INT,
+
+    RegionCount INT,
+    ParentFacilityCount INT,
+    SubFacilityCount INT,
+
+    ReturnedRecordCount BIGINT,
+    IncludeDaysMetCount BIGINT,
+    MappedDetailCount BIGINT,
+    UnmappedDetailCount BIGINT,
+
+    RunStatus VARCHAR(20),
+
+    ErrorNumber INT NULL,
+    ErrorLine INT NULL,
+    ErrorMessage VARCHAR(4000) NULL
+);
+
+
+------------------------------------------------------------
+-- 15) DECLARE LOOP VARIABLES
+------------------------------------------------------------
+
+DECLARE @RangeOrder INT;
+
+DECLARE @MaximumRangeOrder INT;
+
+DECLARE @RangeLabel VARCHAR(100);
+
+DECLARE @PeriodID INT;
+
+DECLARE @EndPeriodID INT;
+
+DECLARE @ReturnedRecordCount BIGINT;
+
+DECLARE @IncludeDaysMetCount BIGINT;
+
+DECLARE @MappedDetailCount BIGINT;
+
+DECLARE @UnmappedDetailCount BIGINT;
+
+SELECT
+    @RangeOrder = MIN(RangeOrder),
+    @MaximumRangeOrder = MAX(RangeOrder)
+FROM @Ranges;
+
+
+------------------------------------------------------------
+-- 16) RUN HB AR059 FOR EACH RANGE
+------------------------------------------------------------
+
+WHILE @RangeOrder <= @MaximumRangeOrder
+BEGIN
+
+    --------------------------------------------------------
+    -- Get current range
+    --------------------------------------------------------
+
+    SELECT
+        @RangeLabel = RangeLabel,
+        @PeriodID = AnalysisPeriodID,
+        @EndPeriodID = ActivityThroughPeriodID
+    FROM @Ranges
+    WHERE RangeOrder = @RangeOrder;
+
+
+    --------------------------------------------------------
+    -- Reset staging table and counts
+    --------------------------------------------------------
+
+    TRUNCATE TABLE #AR059Stage;
+
+    SET @ReturnedRecordCount = 0;
+
+    SET @IncludeDaysMetCount = 0;
+
+    SET @MappedDetailCount = 0;
+
+    SET @UnmappedDetailCount = 0;
+
+
+    BEGIN TRY
+
+        ----------------------------------------------------
+        -- Run the HB AR059 stored procedure
+        ----------------------------------------------------
+
+        INSERT INTO #AR059Stage
+        (
+            FacilityID,
+            FacilityName,
+            InOutType,
+            AccountNumber,
+            SIPGCode,
+            SIPGName,
+            FCCode,
+            FCName,
+            IPCode,
+            IPName,
+            PostingDate,
+            BillingType,
+            AdmissionDate,
+            DischargeDate,
+            TransactionCode,
+            TransactionDescription,
+            TransactionAmount,
+            [Status],
+            RecoveryTakeback,
+            DaysFromAdmission,
+            IncludeExclude,
+            PriorTransaction
+        )
+        EXEC RCA_Code.Analysis.pr_AR059_BadDebtAndInactiveAccountRecoveryPayments
+            @FacilityIDs = @FacilityIDs,
+            @PeriodID = @PeriodID,
+            @EndPeriodID = @EndPeriodID,
+            @InOutTypes = @InOutTypes,
+            @Username = @Username,
+            @RAC = @RAC,
+            @ExcludeAccounts = @ExcludeAccounts,
+            @Status = @Status,
+            @PayorType = @PayorType,
+            @PayorCodes = @PayorCodes,
+            @SystemType = @SystemType,
+            @UDFilter1 = @UDFilter1,
+            @DaysThreshold = @DaysThreshold,
+            @AuthMode = @AuthMode;
+
+
+        ----------------------------------------------------
+        -- Count returned and included records
+        ----------------------------------------------------
+
+        SELECT
+            @ReturnedRecordCount = COUNT_BIG(1)
+        FROM #AR059Stage;
+
+
+        SELECT
+            @IncludeDaysMetCount = COUNT_BIG(1)
+        FROM #AR059Stage
+        WHERE IncludeExclude = 'Include Days Met';
+
+
+        ----------------------------------------------------
+        -- Capture included rows with unmapped Facility IDs
+        ----------------------------------------------------
+
+        INSERT INTO #AR059UnmappedFacilities
+        (
+            RangeOrder,
+            RangeLabel,
+            AnalysisPeriodID,
+            ActivityThroughPeriodID,
+            FacilityID,
+            FacilityName,
+            ReturnedRecordCount
+        )
+        SELECT
+            @RangeOrder,
+            @RangeLabel,
+            @PeriodID,
+            @EndPeriodID,
+            AR.FacilityID,
+            AR.FacilityName,
+            COUNT_BIG(1)
+
+        FROM #AR059Stage AS AR
+
+        LEFT JOIN #HBFacilityMapping AS HM
+            ON HM.SubFacilityID = AR.FacilityID
+
+        WHERE AR.IncludeExclude = 'Include Days Met'
+          AND HM.SubFacilityID IS NULL
+
+        GROUP BY
+            AR.FacilityID,
+            AR.FacilityName;
+
+
+        SELECT
+            @UnmappedDetailCount = COUNT_BIG(1)
+        FROM #AR059Stage AS AR
+
+        LEFT JOIN #HBFacilityMapping AS HM
+            ON HM.SubFacilityID = AR.FacilityID
+
+        WHERE AR.IncludeExclude = 'Include Days Met'
+          AND HM.SubFacilityID IS NULL;
+
+
+        ----------------------------------------------------
+        -- Save mapped included transaction detail
+        ----------------------------------------------------
+
+        INSERT INTO #AR059HBDetail
+        (
+            RangeOrder,
+            RangeLabel,
+            AnalysisPeriodID,
+            ActivityThroughPeriodID,
+
+            RegionID,
+            RegionCode,
+            Region,
+
+            ParentFacilityID,
+            ParentFacilityCode,
+            ParentFacility,
+
+            MappedSubFacilityID,
+            MappedSubFacilityCode,
+            MappedSubFacility,
+
+            FacilityID,
+            FacilityName,
+
+            InOutType,
+            AccountNumber,
+
+            SIPGCode,
+            SIPGName,
+
+            FCCode,
+            FCName,
+
+            IPCode,
+            IPName,
+
+            PostingDate,
+            BillingType,
+            AdmissionDate,
+            DischargeDate,
+
+            TransactionCode,
+            TransactionDescription,
+            TransactionAmount,
+
+            [Status],
+            RecoveryTakeback,
+            DaysFromAdmission,
+            IncludeExclude,
+            PriorTransaction
+        )
+        SELECT
+            @RangeOrder,
+            @RangeLabel,
+            @PeriodID,
+            @EndPeriodID,
+
+            HM.RegionID,
+            HM.RegionCode,
+            HM.Region,
+
+            HM.ParentFacilityID,
+            HM.ParentFacilityCode,
+            HM.ParentFacility,
+
+            HM.SubFacilityID,
+            HM.SubFacilityCode,
+            HM.SubFacility,
+
+            AR.FacilityID,
+            AR.FacilityName,
+
+            AR.InOutType,
+            AR.AccountNumber,
+
+            AR.SIPGCode,
+            AR.SIPGName,
+
+            AR.FCCode,
+            AR.FCName,
+
+            AR.IPCode,
+            AR.IPName,
+
+            AR.PostingDate,
+            AR.BillingType,
+            AR.AdmissionDate,
+            AR.DischargeDate,
+
+            AR.TransactionCode,
+            AR.TransactionDescription,
+            AR.TransactionAmount,
+
+            AR.[Status],
+            AR.RecoveryTakeback,
+            AR.DaysFromAdmission,
+            AR.IncludeExclude,
+            AR.PriorTransaction
+
+        FROM #AR059Stage AS AR
+
+        INNER JOIN #HBFacilityMapping AS HM
+            ON HM.SubFacilityID = AR.FacilityID
+
+        WHERE AR.IncludeExclude = 'Include Days Met';
+
+
+        SET @MappedDetailCount = @@ROWCOUNT;
+
+
+        ----------------------------------------------------
+        -- Log successful range
+        ----------------------------------------------------
+
+        INSERT INTO #AR059RunLog
+        (
+            RangeOrder,
+            RangeLabel,
+            AnalysisPeriodID,
+            ActivityThroughPeriodID,
+
+            RegionCount,
+            ParentFacilityCount,
+            SubFacilityCount,
+
+            ReturnedRecordCount,
+            IncludeDaysMetCount,
+            MappedDetailCount,
+            UnmappedDetailCount,
+
+            RunStatus,
+
+            ErrorNumber,
+            ErrorLine,
+            ErrorMessage
+        )
+        VALUES
+        (
+            @RangeOrder,
+            @RangeLabel,
+            @PeriodID,
+            @EndPeriodID,
+
+            @RegionCount,
+            @ParentFacilityCount,
+            @SubFacilityCount,
+
+            @ReturnedRecordCount,
+            @IncludeDaysMetCount,
+            @MappedDetailCount,
+            @UnmappedDetailCount,
+
+            'Completed',
+
+            NULL,
+            NULL,
+            NULL
+        );
+
+    END TRY
+
+    BEGIN CATCH
+
+        ----------------------------------------------------
+        -- Log error and continue to the next range
+        ----------------------------------------------------
+
+        INSERT INTO #AR059RunLog
+        (
+            RangeOrder,
+            RangeLabel,
+            AnalysisPeriodID,
+            ActivityThroughPeriodID,
+
+            RegionCount,
+            ParentFacilityCount,
+            SubFacilityCount,
+
+            ReturnedRecordCount,
+            IncludeDaysMetCount,
+            MappedDetailCount,
+            UnmappedDetailCount,
+
+            RunStatus,
+
+            ErrorNumber,
+            ErrorLine,
+            ErrorMessage
+        )
+        VALUES
+        (
+            @RangeOrder,
+            @RangeLabel,
+            @PeriodID,
+            @EndPeriodID,
+
+            @RegionCount,
+            @ParentFacilityCount,
+            @SubFacilityCount,
+
+            @ReturnedRecordCount,
+            @IncludeDaysMetCount,
+            @MappedDetailCount,
+            @UnmappedDetailCount,
+
+            'Error',
+
+            ERROR_NUMBER(),
+            ERROR_LINE(),
+            ERROR_MESSAGE()
+        );
+
+    END CATCH;
+
+
+    SET @RangeOrder = @RangeOrder + 1;
+
+END;
+
+
+------------------------------------------------------------
+-- 17) SIX-RANGE OVERALL HB SUMMARY
+--
+-- Combined Inpatient and Outpatient
+------------------------------------------------------------
+
+SELECT
+    RangeOrder,
+    RangeLabel,
+    AnalysisPeriodID,
+    ActivityThroughPeriodID,
+
+    COUNT_BIG(1) AS TransactionRowCount,
+
+    COUNT(DISTINCT AccountNumber) AS DistinctAccountCount,
+
+    SUM
+    (
+        CASE
+            WHEN RecoveryTakeback = 'Net Recovery'
+            THEN TransactionAmount
+            ELSE 0
+        END
+    ) AS NetRecoveryAmount,
+
+    SUM
+    (
+        CASE
+            WHEN RecoveryTakeback = 'Net Takeback'
+            THEN TransactionAmount
+            ELSE 0
+        END
+    ) AS NetTakebackAmount,
+
+    SUM(TransactionAmount) AS NetAmount
+
+FROM #AR059HBDetail
+
+GROUP BY
+    RangeOrder,
+    RangeLabel,
+    AnalysisPeriodID,
+    ActivityThroughPeriodID
+
+ORDER BY
+    RangeOrder;
+
+
+------------------------------------------------------------
+-- 18) RANGE AND INPATIENT/OUTPATIENT SUMMARY
+------------------------------------------------------------
+
+SELECT
+    RangeOrder,
+    RangeLabel,
+    AnalysisPeriodID,
+    ActivityThroughPeriodID,
+    InOutType,
+
+    COUNT_BIG(1) AS TransactionRowCount,
+
+    COUNT(DISTINCT AccountNumber) AS DistinctAccountCount,
+
+    SUM
+    (
+        CASE
+            WHEN RecoveryTakeback = 'Net Recovery'
+            THEN TransactionAmount
+            ELSE 0
+        END
+    ) AS NetRecoveryAmount,
+
+    SUM
+    (
+        CASE
+            WHEN RecoveryTakeback = 'Net Takeback'
+            THEN TransactionAmount
+            ELSE 0
+        END
+    ) AS NetTakebackAmount,
+
+    SUM(TransactionAmount) AS NetAmount
+
+FROM #AR059HBDetail
+
+GROUP BY
+    RangeOrder,
+    RangeLabel,
+    AnalysisPeriodID,
+    ActivityThroughPeriodID,
+    InOutType
+
+ORDER BY
+    RangeOrder,
+    InOutType;
+
+
+------------------------------------------------------------
+-- 19) RANGE AND REGION SUMMARY
+--
+-- Combined Inpatient and Outpatient
+------------------------------------------------------------
+
+SELECT
+    RangeOrder,
+    RangeLabel,
+    AnalysisPeriodID,
+    ActivityThroughPeriodID,
+
+    RegionID,
+    Region,
+
+    COUNT_BIG(1) AS TransactionRowCount,
+
+    COUNT(DISTINCT AccountNumber) AS DistinctAccountCount,
+
+    SUM
+    (
+        CASE
+            WHEN RecoveryTakeback = 'Net Recovery'
+            THEN TransactionAmount
+            ELSE 0
+        END
+    ) AS NetRecoveryAmount,
+
+    SUM
+    (
+        CASE
+            WHEN RecoveryTakeback = 'Net Takeback'
+            THEN TransactionAmount
+            ELSE 0
+        END
+    ) AS NetTakebackAmount,
+
+    SUM(TransactionAmount) AS NetAmount
+
+FROM #AR059HBDetail
+
+GROUP BY
+    RangeOrder,
+    RangeLabel,
+    AnalysisPeriodID,
+    ActivityThroughPeriodID,
+    RegionID,
+    Region
+
+ORDER BY
+    RangeOrder,
+    Region;
+
+
+------------------------------------------------------------
+-- 20) PARENT FACILITY SUMMARY
+--
+-- This is the main requested grouping.
+-- Inpatient and Outpatient are combined.
+------------------------------------------------------------
+
+SELECT
+    RangeOrder,
+    RangeLabel,
+    AnalysisPeriodID,
+    ActivityThroughPeriodID,
+
+    RegionID,
+    Region,
+
+    ParentFacilityID,
+    ParentFacilityCode,
+    ParentFacility,
+
+    COUNT_BIG(1) AS TransactionRowCount,
+
+    COUNT(DISTINCT AccountNumber) AS DistinctAccountCount,
+
+    SUM
+    (
+        CASE
+            WHEN RecoveryTakeback = 'Net Recovery'
+            THEN TransactionAmount
+            ELSE 0
+        END
+    ) AS NetRecoveryAmount,
+
+    SUM
+    (
+        CASE
+            WHEN RecoveryTakeback = 'Net Takeback'
+            THEN TransactionAmount
+            ELSE 0
+        END
+    ) AS NetTakebackAmount,
+
+    SUM(TransactionAmount) AS NetAmount
+
+FROM #AR059HBDetail
+
+GROUP BY
+    RangeOrder,
+    RangeLabel,
+    AnalysisPeriodID,
+    ActivityThroughPeriodID,
+
+    RegionID,
+    Region,
+
+    ParentFacilityID,
+    ParentFacilityCode,
+    ParentFacility
+
+ORDER BY
+    RangeOrder,
+    Region,
+    ParentFacility;
+
+
+------------------------------------------------------------
+-- 21) PARENT FACILITY AND INPATIENT/OUTPATIENT SUMMARY
+--
+-- This shows each Parent Facility split between IP and OP.
+------------------------------------------------------------
+
+SELECT
+    RangeOrder,
+    RangeLabel,
+    AnalysisPeriodID,
+    ActivityThroughPeriodID,
+
+    RegionID,
+    Region,
+
+    ParentFacilityID,
+    ParentFacilityCode,
+    ParentFacility,
+
+    InOutType,
+
+    COUNT_BIG(1) AS TransactionRowCount,
+
+    COUNT(DISTINCT AccountNumber) AS DistinctAccountCount,
+
+    SUM
+    (
+        CASE
+            WHEN RecoveryTakeback = 'Net Recovery'
+            THEN TransactionAmount
+            ELSE 0
+        END
+    ) AS NetRecoveryAmount,
+
+    SUM
+    (
+        CASE
+            WHEN RecoveryTakeback = 'Net Takeback'
+            THEN TransactionAmount
+            ELSE 0
+        END
+    ) AS NetTakebackAmount,
+
+    SUM(TransactionAmount) AS NetAmount
+
+FROM #AR059HBDetail
+
+GROUP BY
+    RangeOrder,
+    RangeLabel,
+    AnalysisPeriodID,
+    ActivityThroughPeriodID,
+
+    RegionID,
+    Region,
+
+    ParentFacilityID,
+    ParentFacilityCode,
+    ParentFacility,
+
+    InOutType
+
+ORDER BY
+    RangeOrder,
+    Region,
+    ParentFacility,
+    InOutType;
+
+
+------------------------------------------------------------
+-- 22) SUBFACILITY SUMMARY
+--
+-- Retained for reconciliation to the underlying facility IDs.
+------------------------------------------------------------
+
+SELECT
+    RangeOrder,
+    RangeLabel,
+    AnalysisPeriodID,
+    ActivityThroughPeriodID,
+
+    RegionID,
+    Region,
+
+    ParentFacilityID,
+    ParentFacility,
+
+    MappedSubFacilityID AS SubFacilityID,
+    MappedSubFacilityCode AS SubFacilityCode,
+    MappedSubFacility AS SubFacility,
+
+    InOutType,
+
+    COUNT_BIG(1) AS TransactionRowCount,
+
+    COUNT(DISTINCT AccountNumber) AS DistinctAccountCount,
+
+    SUM
+    (
+        CASE
+            WHEN RecoveryTakeback = 'Net Recovery'
+            THEN TransactionAmount
+            ELSE 0
+        END
+    ) AS NetRecoveryAmount,
+
+    SUM
+    (
+        CASE
+            WHEN RecoveryTakeback = 'Net Takeback'
+            THEN TransactionAmount
+            ELSE 0
+        END
+    ) AS NetTakebackAmount,
+
+    SUM(TransactionAmount) AS NetAmount
+
+FROM #AR059HBDetail
+
+GROUP BY
+    RangeOrder,
+    RangeLabel,
+    AnalysisPeriodID,
+    ActivityThroughPeriodID,
+
+    RegionID,
+    Region,
+
+    ParentFacilityID,
+    ParentFacility,
+
+    MappedSubFacilityID,
+    MappedSubFacilityCode,
+    MappedSubFacility,
+
+    InOutType
+
+ORDER BY
+    RangeOrder,
+    Region,
+    ParentFacility,
+    MappedSubFacility,
+    InOutType;
+
+
+------------------------------------------------------------
+-- 23) PARENT FACILITY FINANCIAL CLASS SUMMARY
+------------------------------------------------------------
+
+SELECT
+    RangeOrder,
+    RangeLabel,
+    AnalysisPeriodID,
+    ActivityThroughPeriodID,
+
+    Region,
+    ParentFacility,
+    InOutType,
+
+    FCCode AS FinancialClassCode,
+    FCName AS FinancialClass,
+
+    RecoveryTakeback,
+
+    COUNT_BIG(1) AS TransactionRowCount,
+
+    COUNT(DISTINCT AccountNumber) AS DistinctAccountCount,
+
+    SUM(TransactionAmount) AS TotalTransactionAmount
+
+FROM #AR059HBDetail
+
+GROUP BY
+    RangeOrder,
+    RangeLabel,
+    AnalysisPeriodID,
+    ActivityThroughPeriodID,
+
+    Region,
+    ParentFacility,
+    InOutType,
+
+    FCCode,
+    FCName,
+
+    RecoveryTakeback
+
+ORDER BY
+    RangeOrder,
+    Region,
+    ParentFacility,
+    InOutType,
+    FCName,
+    RecoveryTakeback;
+
+
+------------------------------------------------------------
+-- 24) UNMAPPED FACILITY DIAGNOSTICS
+--
+-- Ideally, this returns no rows.
+--
+-- If rows appear here, AR059 returned a FacilityID that did
+-- not match a SubFacilityID in the hierarchy.
+------------------------------------------------------------
+
+SELECT
+    RangeOrder,
+    RangeLabel,
+    AnalysisPeriodID,
+    ActivityThroughPeriodID,
+
+    FacilityID,
+    FacilityName,
+
+    ReturnedRecordCount
+
+FROM #AR059UnmappedFacilities
+
+ORDER BY
+    RangeOrder,
+    FacilityName,
+    FacilityID;
+
+
+------------------------------------------------------------
+-- 25) RUN LOG
+--
+-- All six ranges should show Completed.
+--
+-- IncludeDaysMetCount should equal:
+--
+-- MappedDetailCount + UnmappedDetailCount
+------------------------------------------------------------
+
+SELECT
+    RangeOrder,
+    RangeLabel,
+    AnalysisPeriodID,
+    ActivityThroughPeriodID,
+
+    RegionCount,
+    ParentFacilityCount,
+    SubFacilityCount,
+
+    ReturnedRecordCount,
+    IncludeDaysMetCount,
+    MappedDetailCount,
+    UnmappedDetailCount,
+
+    IncludeDaysMetCount
+        - MappedDetailCount
+        - UnmappedDetailCount AS ReconciliationDifference,
+
+    RunStatus,
+
+    ErrorNumber,
+    ErrorLine,
+    ErrorMessage
+
+FROM #AR059RunLog
+
+ORDER BY
+    RangeOrder;
+
+
+------------------------------------------------------------
+-- 26) COMPLETE HB TRANSACTION DETAIL
+--
+-- This is the complete result to export.
+--
+-- Parent Facility is included for the requested grouping.
+-- SubFacility is retained for reconciliation.
+------------------------------------------------------------
+
+SELECT
+    RangeOrder,
+    RangeLabel,
+    AnalysisPeriodID,
+    ActivityThroughPeriodID,
+
+    RegionID,
+    RegionCode,
+    Region,
+
+    ParentFacilityID,
+    ParentFacilityCode,
+    ParentFacility,
+
+    MappedSubFacilityID AS SubFacilityID,
+    MappedSubFacilityCode AS SubFacilityCode,
+    MappedSubFacility AS SubFacility,
+
+    FacilityID AS AR059FacilityID,
+    FacilityName AS AR059FacilityName,
+
+    InOutType,
+    AccountNumber,
+
+    RecoveryTakeback,
+    PostingDate,
+
+    TransactionCode,
+    TransactionDescription,
+    TransactionAmount,
+
+    SIPGCode,
+    SIPGName,
+
+    FCCode,
+    FCName,
+
+    IPCode,
+    IPName,
+
+    BillingType,
+    AdmissionDate,
+    DischargeDate,
+
+    [Status],
+    DaysFromAdmission,
+    IncludeExclude,
+    PriorTransaction
+
+FROM #AR059HBDetail
+
+ORDER BY
+    RangeOrder,
+    Region,
+    ParentFacility,
+    MappedSubFacility,
+    InOutType,
+    AccountNumber,
+    PostingDate,
+    TransactionCode;
