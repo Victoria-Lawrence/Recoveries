@@ -365,209 +365,11 @@ WHERE FacilityRow = 1;
 
 
 ------------------------------------------------------------
--- 9) CREATE REPORT REGION FACILITY CANDIDATES
---
--- This joins:
---
--- Authorized Facility
---     to Analysis.FacilityGroup
---     to the verified Report Region list
---     to Analysis.dimGroupCategory
 ------------------------------------------------------------
-
-IF OBJECT_ID('tempdb..#ReportRegionCandidates') IS NOT NULL
-    DROP TABLE #ReportRegionCandidates;
-
-CREATE TABLE #ReportRegionCandidates
-(
-    ReportRegionID INT NOT NULL,
-    ReportRegion VARCHAR(128) NOT NULL,
-
-    Specialty VARCHAR(128) NULL,
-    AU VARCHAR(9) NULL,
-
-    FacilityID INT NOT NULL,
-    FacilityCode VARCHAR(100) NULL,
-    FacilityName VARCHAR(255) NULL
-);
-
-INSERT INTO #ReportRegionCandidates
-(
-    ReportRegionID,
-    ReportRegion,
-
-    Specialty,
-    AU,
-
-    FacilityID,
-    FacilityCode,
-    FacilityName
-)
-SELECT DISTINCT
-    GC.GroupCategoryID AS ReportRegionID,
-    LTRIM(RTRIM(GC.GroupCategoryName)) AS ReportRegion,
-
-    APB.Specialty,
-    APB.AU,
-
-    APB.FacilityID,
-    APB.FacilityCode,
-    APB.FacilityName
-
-FROM #AuthorizedPBFacilities AS APB
-
-INNER JOIN Analysis.FacilityGroup AS FG
-    ON FG.FacilityID = APB.FacilityID
-
-INNER JOIN @ReportRegions AS RR
-    ON RR.ReportRegionID = FG.GroupCategoryID
-
-INNER JOIN Analysis.dimGroupCategory AS GC
-    ON GC.GroupCategoryID = FG.GroupCategoryID;
-
-
-------------------------------------------------------------
--- 10) AUTHORIZED FACILITIES WITHOUT REPORT REGION
+-- 9) CREATE PB REPORT REGION MAPPING
 --
--- These facilities are authorized for the selected username
--- but are not assigned to one of the verified Report Regions.
---
--- The result is returned now for review. These facilities
--- are not passed into AR059 by this version.
-------------------------------------------------------------
-
-IF OBJECT_ID('tempdb..#FacilitiesWithoutReportRegion') IS NOT NULL
-    DROP TABLE #FacilitiesWithoutReportRegion;
-
-CREATE TABLE #FacilitiesWithoutReportRegion
-(
-    Specialty VARCHAR(128) NULL,
-    AU VARCHAR(9) NULL,
-
-    FacilityID INT NOT NULL,
-    FacilityCode VARCHAR(100) NULL,
-    FacilityName VARCHAR(255) NULL
-);
-
-INSERT INTO #FacilitiesWithoutReportRegion
-(
-    Specialty,
-    AU,
-
-    FacilityID,
-    FacilityCode,
-    FacilityName
-)
-SELECT
-    APB.Specialty,
-    APB.AU,
-
-    APB.FacilityID,
-    APB.FacilityCode,
-    APB.FacilityName
-
-FROM #AuthorizedPBFacilities AS APB
-
-LEFT JOIN #ReportRegionCandidates AS RRC
-    ON RRC.FacilityID = APB.FacilityID
-
-WHERE RRC.FacilityID IS NULL;
-
-
-------------------------------------------------------------
--- 11) CHECK FOR MULTIPLE REPORT REGION ASSIGNMENTS
---
--- A facility mapped to multiple Report Regions would cause
--- duplicate AR059 detail rows after the mapping join.
---
--- The script stops rather than selecting a region
--- arbitrarily.
-------------------------------------------------------------
-
-IF OBJECT_ID('tempdb..#MultipleReportRegionFacilities') IS NOT NULL
-    DROP TABLE #MultipleReportRegionFacilities;
-
-CREATE TABLE #MultipleReportRegionFacilities
-(
-    FacilityID INT NOT NULL,
-    FacilityCode VARCHAR(100) NULL,
-    FacilityName VARCHAR(255) NULL,
-    ReportRegionCount INT NOT NULL,
-    ReportRegionList VARCHAR(MAX) NULL
-);
-
-INSERT INTO #MultipleReportRegionFacilities
-(
-    FacilityID,
-    FacilityCode,
-    FacilityName,
-    ReportRegionCount,
-    ReportRegionList
-)
-SELECT
-    RRC.FacilityID,
-    MAX(RRC.FacilityCode) AS FacilityCode,
-    MAX(RRC.FacilityName) AS FacilityName,
-
-    COUNT(DISTINCT RRC.ReportRegionID) AS ReportRegionCount,
-
-    STUFF
-    (
-        (
-            SELECT DISTINCT
-                ', ' + RRC2.ReportRegion
-
-            FROM #ReportRegionCandidates AS RRC2
-
-            WHERE RRC2.FacilityID = RRC.FacilityID
-
-            ORDER BY
-                ', ' + RRC2.ReportRegion
-
-            FOR XML PATH(''), TYPE
-        ).value('.', 'VARCHAR(MAX)'),
-        1,
-        2,
-        ''
-    ) AS ReportRegionList
-
-FROM #ReportRegionCandidates AS RRC
-
-GROUP BY
-    RRC.FacilityID
-
-HAVING COUNT(DISTINCT RRC.ReportRegionID) > 1;
-
-
-IF EXISTS
-(
-    SELECT 1
-    FROM #MultipleReportRegionFacilities
-)
-BEGIN
-
-    SELECT
-        FacilityID,
-        FacilityCode,
-        FacilityName,
-        ReportRegionCount,
-        ReportRegionList
-
-    FROM #MultipleReportRegionFacilities
-
-    ORDER BY
-        FacilityName,
-        FacilityID;
-
-    THROW 50004,
-        'One or more PB facilities are assigned to multiple Report Regions. Review the diagnostic result before running AR059.',
-        1;
-
-END;
-
-
-------------------------------------------------------------
--- 12) CREATE FINAL ONE-ROW-PER-FACILITY MAPPING
+-- Maps each authorized PB FacilityID1 to its verified
+-- Report Region.
 ------------------------------------------------------------
 
 IF OBJECT_ID('tempdb..#PBReportRegionMapping') IS NOT NULL
@@ -590,30 +392,37 @@ INSERT INTO #PBReportRegionMapping
 (
     ReportRegionID,
     ReportRegion,
-
     Specialty,
     AU,
-
     FacilityID,
     FacilityCode,
     FacilityName
 )
-SELECT
-    RRC.ReportRegionID,
-    RRC.ReportRegion,
+SELECT DISTINCT
+    GC.GroupCategoryID,
+    LTRIM(RTRIM(GC.GroupCategoryName)),
 
-    RRC.Specialty,
-    RRC.AU,
+    APB.Specialty,
+    APB.AU,
 
-    RRC.FacilityID,
-    RRC.FacilityCode,
-    RRC.FacilityName
+    APB.FacilityID,
+    APB.FacilityCode,
+    APB.FacilityName
 
-FROM #ReportRegionCandidates AS RRC;
+FROM #AuthorizedPBFacilities AS APB
+
+INNER JOIN Analysis.FacilityGroup AS FG
+    ON FG.FacilityID = APB.FacilityID
+
+INNER JOIN @ReportRegions AS RR
+    ON RR.ReportRegionID = FG.GroupCategoryID
+
+INNER JOIN Analysis.dimGroupCategory AS GC
+    ON GC.GroupCategoryID = FG.GroupCategoryID;
 
 
 ------------------------------------------------------------
--- 13) VERIFY REPORT REGION FACILITIES
+-- 10) VERIFY REPORT REGION MAPPING EXISTS
 ------------------------------------------------------------
 
 IF NOT EXISTS
@@ -631,15 +440,100 @@ END;
 
 
 ------------------------------------------------------------
+-- 11) CHECK WHETHER ANY FACILITY HAS MORE THAN ONE
+--     REPORT REGION
+------------------------------------------------------------
+
+SELECT
+    FacilityID,
+    MAX(FacilityCode) AS FacilityCode,
+    MAX(FacilityName) AS FacilityName,
+    COUNT(DISTINCT ReportRegionID) AS ReportRegionCount
+
+FROM #PBReportRegionMapping
+
+GROUP BY
+    FacilityID
+
+HAVING COUNT(DISTINCT ReportRegionID) > 1
+
+ORDER BY
+    FacilityID;
+
+
+------------------------------------------------------------
+-- 12) CREATE AUTHORIZED FACILITIES WITHOUT REPORT REGION
+------------------------------------------------------------
+
+IF OBJECT_ID('tempdb..#FacilitiesWithoutReportRegion') IS NOT NULL
+    DROP TABLE #FacilitiesWithoutReportRegion;
+
+CREATE TABLE #FacilitiesWithoutReportRegion
+(
+    Specialty VARCHAR(128) NULL,
+    AU VARCHAR(9) NULL,
+    FacilityID INT NOT NULL,
+    FacilityCode VARCHAR(100) NULL,
+    FacilityName VARCHAR(255) NULL
+);
+
+INSERT INTO #FacilitiesWithoutReportRegion
+(
+    Specialty,
+    AU,
+    FacilityID,
+    FacilityCode,
+    FacilityName
+)
+SELECT
+    APB.Specialty,
+    APB.AU,
+    APB.FacilityID,
+    APB.FacilityCode,
+    APB.FacilityName
+
+FROM #AuthorizedPBFacilities AS APB
+
+LEFT JOIN #PBReportRegionMapping AS RM
+    ON RM.FacilityID = APB.FacilityID
+
+WHERE RM.FacilityID IS NULL;
+
+
+------------------------------------------------------------
+-- 13) VALIDATE REPORT REGION ASSIGNMENT
+--
+-- Stop if one PB facility belongs to multiple Report Regions.
+-- Otherwise the AR059 detail would duplicate when joined.
+------------------------------------------------------------
+
+IF EXISTS
+(
+    SELECT
+        FacilityID
+
+    FROM #PBReportRegionMapping
+
+    GROUP BY
+        FacilityID
+
+    HAVING COUNT(DISTINCT ReportRegionID) > 1
+)
+BEGIN
+
+    THROW 50004,
+        'One or more PB facilities are assigned to multiple Report Regions. Review the diagnostic result above.',
+        1;
+
+END;
+
+------------------------------------------------------------
 -- 14) BUILD COMMA-SEPARATED FACILITY LIST
 ------------------------------------------------------------
 
 DECLARE @FacilityIDs VARCHAR(MAX);
-
 DECLARE @FacilityCount INT;
-
 DECLARE @ReportRegionCount INT;
-
 DECLARE @SpecialtyCount INT;
 
 SELECT
@@ -941,29 +835,32 @@ CREATE TABLE #AR059UnmappedFacilities
 
 ------------------------------------------------------------
 -- 22) CREATE RUN LOG
+--
+-- V2 name prevents SQL Server from binding to an older
+-- #AR059PBRunLog temp-table definition during compilation.
 ------------------------------------------------------------
 
-IF OBJECT_ID('tempdb..#AR059RunLog') IS NOT NULL
-    DROP TABLE #AR059RunLog;
+IF OBJECT_ID('tempdb..#AR059PBRunLog') IS NOT NULL
+    DROP TABLE #AR059PBRunLog;
 
-CREATE TABLE #AR059RunLog
+CREATE TABLE #AR059PBRunLog
 (
-    RangeOrder INT,
-    RangeLabel VARCHAR(100),
+    RangeOrder INT NOT NULL,
+    RangeLabel VARCHAR(100) NULL,
 
-    AnalysisPeriodID INT,
-    ActivityThroughPeriodID INT,
+    AnalysisPeriodID INT NULL,
+    ActivityThroughPeriodID INT NULL,
 
-    ReportRegionCount INT,
-    SpecialtyCount INT,
-    FacilityCount INT,
+    ReportRegionCount INT NULL,
+    SpecialtyCount INT NULL,
+    FacilityCount INT NULL,
 
-    ReturnedRecordCount BIGINT,
-    IncludeDaysMetCount BIGINT,
-    MappedDetailCount BIGINT,
-    UnmappedDetailCount BIGINT,
+    ReturnedRecordCount BIGINT NULL,
+    IncludeDaysMetCount BIGINT NULL,
+    MappedDetailCount BIGINT NULL,
+    UnmappedDetailCount BIGINT NULL,
 
-    RunStatus VARCHAR(20),
+    RunStatus VARCHAR(20) NULL,
 
     ErrorNumber INT NULL,
     ErrorLine INT NULL,
@@ -1039,39 +936,25 @@ BEGIN
         (
             FacilityID,
             FacilityName,
-
             InOutType,
             AccountNumber,
-
             SIPGCode,
             SIPGName,
-
             FCCode,
             FCName,
-
             IPCode,
             IPName,
-
             PostingDate,
-
             BillingType,
-
             AdmissionDate,
             DischargeDate,
-
             TransactionCode,
             TransactionDescription,
-
             TransactionAmount,
-
             [Status],
-
             RecoveryTakeback,
-
             DaysFromAdmission,
-
             IncludeExclude,
-
             PriorTransaction
         )
         EXEC RCA_Phys_Code.Analysis.pr_AR059_BadDebtAndInactiveAccountRecoveryPayments
@@ -1292,7 +1175,7 @@ BEGIN
         -- Log successful range
         ----------------------------------------------------
 
-        INSERT INTO #AR059RunLog
+        INSERT INTO #AR059PBRunLog
         (
             RangeOrder,
             RangeLabel,
@@ -1353,7 +1236,7 @@ BEGIN
         -- Log error and continue to the next range
         ----------------------------------------------------
 
-        INSERT INTO #AR059RunLog
+        INSERT INTO #AR059PBRunLog
         (
             RangeOrder,
             RangeLabel,
@@ -1721,7 +1604,6 @@ ORDER BY
 -- 31) RUN LOG
 --
 -- All six ranges should show Completed.
---
 -- ReconciliationDifference should be zero.
 ------------------------------------------------------------
 
@@ -1737,11 +1619,8 @@ SELECT
     FacilityCount,
 
     ReturnedRecordCount,
-
     IncludeDaysMetCount,
-
     MappedDetailCount,
-
     UnmappedDetailCount,
 
     IncludeDaysMetCount
@@ -1754,11 +1633,10 @@ SELECT
     ErrorLine,
     ErrorMessage
 
-FROM #AR059RunLog
+FROM #AR059PBRunLog
 
 ORDER BY
     RangeOrder;
-
 
 ------------------------------------------------------------
 -- 32) COMPLETE PB TRANSACTION DETAIL
