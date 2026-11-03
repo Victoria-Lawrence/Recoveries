@@ -1,0 +1,1111 @@
+
+USE [RCA_Phys_Code];
+GO
+
+SET NOCOUNT ON;
+SET XACT_ABORT ON;
+
+
+/*==============================================================
+  HTPN WO&M AR059 RECOVERY DETAIL
+  Report Group Selection:
+      GroupCategoryID = 1018
+
+  This version:
+      1. Uses the HTPN WO&M report-group facility mapping.
+      2. Retains Specialty and AU from Facility Structure.
+      3. Runs the existing AR059 procedure for six ranges.
+      4. Returns summary, diagnostics, and complete detail.
+==============================================================*/
+
+
+------------------------------------------------------------
+-- 1) GENERAL SETTINGS
+------------------------------------------------------------
+
+DECLARE @Username VARCHAR(50) = 'BHCS\vstevens';
+
+/*
+This version runs all authorized Professional Billing facilities.
+It is no longer restricted to GroupCategoryID 1018.
+*/
+
+DECLARE @GroupCategoryID INT = NULL;
+DECLARE @GroupCategoryName VARCHAR(128) = 'All PB';
+
+DECLARE @InOutTypes VARCHAR(20) = 'Outpatient';
+DECLARE @RAC INT = 1;
+DECLARE @ExcludeAccounts INT = 0;
+DECLARE @Status VARCHAR(20) = 'BAD DEBT,INACTIVE';
+DECLARE @PayorType VARCHAR(31) = 'Financial Class';
+
+/*
+    NULL means all financial classes/payors.
+*/
+DECLARE @PayorCodes VARCHAR(MAX) = NULL;
+
+DECLARE @SystemType VARCHAR(MAX) = NULL;
+DECLARE @UDFilter1 VARCHAR(MAX) = NULL;
+DECLARE @DaysThreshold INT = 30;
+DECLARE @AuthMode VARCHAR(10) = 'AD';
+
+
+------------------------------------------------------------
+-- 2) SIX RECOVERY RANGES
+--
+-- AnalysisPeriodID:
+--     Analysis Date selected in Crowe
+--
+-- ActivityThroughPeriodID:
+--     Activity Through date selected in Crowe
+------------------------------------------------------------
+
+DECLARE @Ranges TABLE
+(
+    RangeOrder INT NOT NULL PRIMARY KEY,
+    RangeLabel VARCHAR(100) NOT NULL,
+    AnalysisPeriodID INT NOT NULL,
+    ActivityThroughPeriodID INT NOT NULL
+);
+
+INSERT INTO @Ranges
+(
+    RangeOrder,
+    RangeLabel,
+    AnalysisPeriodID,
+    ActivityThroughPeriodID
+)
+VALUES
+    (1, 'Range 1', 20250731, 20260731),
+    (2, 'Range 2', 20250630, 20260630),
+    (3, 'Range 3', 20250531, 20260531),
+    (4, 'Range 4', 20250430, 20260430),
+    (5, 'Range 5', 20250331, 20260331),
+    (6, 'Range 6', 20250831, 20260831);
+
+
+------------------------------------------------------------
+-- 3) VALIDATE RANGE DATES
+------------------------------------------------------------
+
+IF EXISTS
+(
+    SELECT 1
+    FROM @Ranges
+    WHERE AnalysisPeriodID >= ActivityThroughPeriodID
+)
+BEGIN
+    THROW 50001,
+          'Each Analysis Period must be earlier than its Activity Through Period.',
+          1;
+END;
+
+
+------------------------------------------------------------
+-- 4) GET REPORT-GROUP NAME - Removed as not needed for PB All
+------------------------------------------------------------
+
+
+------------------------------------------------------------
+-- 5) LOAD AUTHORIZED FACILITY STRUCTURE
+------------------------------------------------------------
+
+IF OBJECT_ID('tempdb..#FacilityStructure') IS NOT NULL
+    DROP TABLE #FacilityStructure;
+
+CREATE TABLE #FacilityStructure
+(
+    MaxFacilityLevel INT,
+
+    FacilityID1 INT,
+    FacilityLevelType1 VARCHAR(100),
+    FacilityCode1 VARCHAR(100),
+    FacilityName1 VARCHAR(255),
+
+    FacilityID2 INT,
+    FacilityLevelType2 VARCHAR(100),
+    FacilityCode2 VARCHAR(100),
+    FacilityName2 VARCHAR(255),
+
+    FacilityID3 INT,
+    FacilityLevelType3 VARCHAR(100),
+    FacilityCode3 VARCHAR(100),
+    FacilityName3 VARCHAR(255),
+
+    FacilityID4 INT,
+    FacilityLevelType4 VARCHAR(100),
+    FacilityCode4 VARCHAR(100),
+    FacilityName4 VARCHAR(255),
+
+    FacilityID5 INT NULL,
+    FacilityLevelType5 VARCHAR(100) NULL,
+    FacilityCode5 VARCHAR(100) NULL,
+    FacilityName5 VARCHAR(255) NULL,
+
+    FacilityID6 INT NULL,
+    FacilityLevelType6 VARCHAR(100) NULL,
+    FacilityCode6 VARCHAR(100) NULL,
+    FacilityName6 VARCHAR(255) NULL
+);
+
+INSERT INTO #FacilityStructure
+EXEC RCA_Phys_Code.Analysis.p_MappingDataFacilityStructure
+    @UserName = @Username;
+
+
+------------------------------------------------------------
+-- 6) CREATE ALL-PB FACILITY MAPPING
+--
+-- FacilityID1   = Actual PB subfacility ID
+-- FacilityName1 = Actual PB subfacility name
+-- FacilityName2 = Specialty/report group
+--
+-- This includes every authorized PB facility returned by
+-- p_MappingDataFacilityStructure. It is no longer restricted
+-- to Analysis.FacilityGroup or GroupCategoryID 1018.
+------------------------------------------------------------
+
+IF OBJECT_ID('tempdb..#GroupFacilities') IS NOT NULL
+    DROP TABLE #GroupFacilities;
+
+CREATE TABLE #GroupFacilities
+(
+    GroupCategoryID INT NULL,
+    GroupCategoryName VARCHAR(128) NULL,
+    Specialty VARCHAR(128) NULL,
+    AU VARCHAR(9) NULL,
+    FacilityID INT NOT NULL,
+    FacilityCode VARCHAR(100) NULL,
+    FacilityName VARCHAR(255) NULL
+);
+
+INSERT INTO #GroupFacilities
+(
+    GroupCategoryID,
+    GroupCategoryName,
+    Specialty,
+    AU,
+    FacilityID,
+    FacilityCode,
+    FacilityName
+)
+SELECT DISTINCT
+    NULL AS GroupCategoryID,
+    'All PB' AS GroupCategoryName,
+    NULLIF(LTRIM(RTRIM(FS.FacilityName2)), '') AS Specialty,
+    LEFT(LTRIM(RTRIM(FS.FacilityName1)), 9) AS AU,
+    FS.FacilityID1 AS FacilityID,
+    FS.FacilityCode1 AS FacilityCode,
+    FS.FacilityName1 AS FacilityName
+FROM #FacilityStructure AS FS
+WHERE FS.FacilityID1 IS NOT NULL;
+
+
+------------------------------------------------------------
+-- 7) VERIFY ALL-PB FACILITIES
+------------------------------------------------------------
+
+IF NOT EXISTS
+(
+    SELECT 1
+    FROM #GroupFacilities
+)
+BEGIN
+    THROW 50003,
+        'No authorized PB facilities were returned for the selected username.',
+        1;
+END;
+
+
+------------------------------------------------------------
+-- 8) CREATE ONE MAPPING ROW PER FACILITY
+--
+-- This prevents AR059 rows from duplicating if the authorized
+-- facility hierarchy contains duplicate facility rows.
+------------------------------------------------------------
+
+IF OBJECT_ID('tempdb..#GroupFacilityMapping') IS NOT NULL
+    DROP TABLE #GroupFacilityMapping;
+
+CREATE TABLE #GroupFacilityMapping
+(
+    GroupCategoryID INT NULL,
+    GroupCategoryName VARCHAR(128) NULL,
+    Specialty VARCHAR(128) NULL,
+    AU VARCHAR(9) NULL,
+    FacilityID INT NOT NULL,
+    FacilityCode VARCHAR(100) NULL,
+    FacilityName VARCHAR(255) NULL
+);
+
+;WITH RankedFacilityMapping AS
+(
+    SELECT
+        GF.GroupCategoryID,
+        GF.GroupCategoryName,
+        GF.Specialty,
+        GF.AU,
+        GF.FacilityID,
+        GF.FacilityCode,
+        GF.FacilityName,
+        ROW_NUMBER() OVER
+        (
+            PARTITION BY GF.FacilityID
+            ORDER BY
+                CASE
+                    WHEN GF.Specialty IS NULL THEN 1
+                    ELSE 0
+                END,
+                GF.Specialty,
+                GF.FacilityName,
+                GF.FacilityCode
+        ) AS MappingRow
+    FROM #GroupFacilities AS GF
+)
+INSERT INTO #GroupFacilityMapping
+(
+    GroupCategoryID,
+    GroupCategoryName,
+    Specialty,
+    AU,
+    FacilityID,
+    FacilityCode,
+    FacilityName
+)
+SELECT
+    GroupCategoryID,
+    GroupCategoryName,
+    Specialty,
+    AU,
+    FacilityID,
+    FacilityCode,
+    FacilityName
+FROM RankedFacilityMapping
+WHERE MappingRow = 1;
+
+
+------------------------------------------------------------
+-- 9) BUILD COMMA-SEPARATED ALL-PB FACILITY LIST
+------------------------------------------------------------
+
+DECLARE @FacilityIDs VARCHAR(MAX);
+DECLARE @FacilityCount INT;
+DECLARE @SpecialtyCount INT;
+
+SELECT
+    @FacilityIDs =
+        STUFF
+        (
+            (
+                SELECT
+                    ',' + CAST(F.FacilityID AS VARCHAR(20))
+                FROM
+                (
+                    SELECT DISTINCT
+                        FacilityID
+                    FROM #GroupFacilityMapping
+                ) AS F
+                ORDER BY
+                    F.FacilityID
+                FOR XML PATH(''), TYPE
+            ).value('.', 'VARCHAR(MAX)'),
+            1,
+            1,
+            ''
+        );
+
+SELECT
+    @FacilityCount = COUNT(DISTINCT FacilityID),
+    @SpecialtyCount = COUNT
+    (
+        DISTINCT CASE
+            WHEN Specialty IS NOT NULL THEN Specialty
+        END
+    )
+FROM #GroupFacilityMapping;
+
+IF NULLIF(LTRIM(RTRIM(@FacilityIDs)), '') IS NULL
+BEGIN
+    THROW 50004,
+        'The authorized PB FacilityID list is empty.',
+        1;
+END;
+
+
+------------------------------------------------------------
+-- 10) FACILITY AND SPECIALTY VALIDATION
+------------------------------------------------------------
+
+SELECT
+    GroupCategoryName,
+    Specialty,
+    AU,
+    FacilityID,
+    FacilityCode,
+    FacilityName
+FROM #GroupFacilityMapping
+ORDER BY
+    Specialty,
+    AU,
+    FacilityName,
+    FacilityID;
+
+
+SELECT
+    Specialty,
+    COUNT(DISTINCT FacilityID) AS FacilityCount
+FROM #GroupFacilityMapping
+GROUP BY
+    Specialty
+ORDER BY
+    Specialty;
+
+
+SELECT
+    @GroupCategoryName AS ProcessingScope,
+    @SpecialtyCount AS SpecialtyCount,
+    @FacilityCount AS FacilityCount,
+    @FacilityIDs AS FacilityIDList;
+------------------------------------------------------------
+-- 11) CREATE AR059 STAGING TABLE
+--
+-- This must match the columns returned by:
+-- Analysis.pr_AR059_BadDebtAndInactiveAccountRecoveryPayments
+------------------------------------------------------------
+
+IF OBJECT_ID('tempdb..#AR059Stage') IS NOT NULL
+    DROP TABLE #AR059Stage;
+
+CREATE TABLE #AR059Stage
+(
+    FacilityID INT,
+    FacilityName VARCHAR(256),
+    InOutType VARCHAR(32),
+    AccountNumber VARCHAR(256),
+
+    SIPGCode VARCHAR(50),
+    SIPGName VARCHAR(256),
+
+    FCCode VARCHAR(50),
+    FCName VARCHAR(256),
+
+    IPCode VARCHAR(50),
+    IPName VARCHAR(256),
+
+    PostingDate DATETIME,
+    BillingType VARCHAR(50),
+    AdmissionDate DATETIME,
+    DischargeDate DATETIME,
+
+    TransactionCode VARCHAR(50),
+    TransactionDescription VARCHAR(256),
+    TransactionAmount MONEY,
+
+    [Status] VARCHAR(20),
+    RecoveryTakeback VARCHAR(20),
+    DaysFromAdmission INT,
+    IncludeExclude VARCHAR(50),
+    PriorTransaction VARCHAR(50)
+);
+
+
+------------------------------------------------------------
+-- 12) CREATE FINAL SIX-RANGE DETAIL TABLE
+------------------------------------------------------------
+
+IF OBJECT_ID('tempdb..#AR059GroupDetail') IS NOT NULL
+    DROP TABLE #AR059GroupDetail;
+
+CREATE TABLE #AR059GroupDetail
+(
+    RangeOrder INT,
+    RangeLabel VARCHAR(100),
+    AnalysisPeriodID INT,
+    ActivityThroughPeriodID INT,
+
+    GroupCategoryID INT,
+    GroupCategoryName VARCHAR(128),
+
+    Specialty VARCHAR(128),
+    AU VARCHAR(9),
+
+    MappedFacilityID INT,
+    MappedFacilityCode VARCHAR(100),
+    MappedFacilityName VARCHAR(255),
+
+    FacilityID INT,
+    FacilityName VARCHAR(256),
+    InOutType VARCHAR(32),
+    AccountNumber VARCHAR(256),
+
+    SIPGCode VARCHAR(50),
+    SIPGName VARCHAR(256),
+
+    FCCode VARCHAR(50),
+    FCName VARCHAR(256),
+
+    IPCode VARCHAR(50),
+    IPName VARCHAR(256),
+
+    PostingDate DATETIME,
+    BillingType VARCHAR(50),
+    AdmissionDate DATETIME,
+    DischargeDate DATETIME,
+
+    TransactionCode VARCHAR(50),
+    TransactionDescription VARCHAR(256),
+    TransactionAmount MONEY,
+
+    [Status] VARCHAR(20),
+    RecoveryTakeback VARCHAR(20),
+    DaysFromAdmission INT,
+    IncludeExclude VARCHAR(50),
+    PriorTransaction VARCHAR(50)
+);
+
+
+------------------------------------------------------------
+-- 13) CREATE RUN LOG
+------------------------------------------------------------
+
+IF OBJECT_ID('tempdb..#AR059RunLog') IS NOT NULL
+    DROP TABLE #AR059RunLog;
+
+CREATE TABLE #AR059RunLog
+(
+    RangeOrder INT,
+    RangeLabel VARCHAR(100),
+    AnalysisPeriodID INT,
+    ActivityThroughPeriodID INT,
+
+    GroupCategoryID INT,
+    GroupCategoryName VARCHAR(128),
+
+    FacilityCount INT,
+    ReturnedRecordCount BIGINT,
+    IncludeDaysMetCount BIGINT,
+    FinalDetailCount BIGINT,
+
+    RunStatus VARCHAR(20),
+    ErrorNumber INT NULL,
+    ErrorLine INT NULL,
+    ErrorMessage VARCHAR(4000) NULL
+);
+
+
+------------------------------------------------------------
+-- 14) DECLARE LOOP VARIABLES
+------------------------------------------------------------
+
+DECLARE @RangeOrder INT;
+DECLARE @MaximumRangeOrder INT;
+
+DECLARE @RangeLabel VARCHAR(100);
+DECLARE @PeriodID INT;
+DECLARE @EndPeriodID INT;
+
+DECLARE @ReturnedRecordCount BIGINT;
+DECLARE @IncludeDaysMetCount BIGINT;
+DECLARE @FinalDetailCount BIGINT;
+
+
+SELECT
+    @RangeOrder = MIN(RangeOrder),
+    @MaximumRangeOrder = MAX(RangeOrder)
+FROM @Ranges;
+
+
+------------------------------------------------------------
+-- 15) RUN AR059 FOR EACH RANGE
+------------------------------------------------------------
+
+WHILE @RangeOrder <= @MaximumRangeOrder
+BEGIN
+
+    --------------------------------------------------------
+    -- Get current range
+    --------------------------------------------------------
+
+    SELECT
+        @RangeLabel = RangeLabel,
+        @PeriodID = AnalysisPeriodID,
+        @EndPeriodID = ActivityThroughPeriodID
+    FROM @Ranges
+    WHERE RangeOrder = @RangeOrder;
+
+
+    --------------------------------------------------------
+    -- Reset staging table and counts
+    --------------------------------------------------------
+
+    TRUNCATE TABLE #AR059Stage;
+
+    SET @ReturnedRecordCount = 0;
+    SET @IncludeDaysMetCount = 0;
+    SET @FinalDetailCount = 0;
+
+
+    BEGIN TRY
+
+        ----------------------------------------------------
+        -- Run the existing AR059 stored procedure
+        ----------------------------------------------------
+
+        INSERT INTO #AR059Stage
+        (
+            FacilityID,
+            FacilityName,
+            InOutType,
+            AccountNumber,
+
+            SIPGCode,
+            SIPGName,
+
+            FCCode,
+            FCName,
+
+            IPCode,
+            IPName,
+
+            PostingDate,
+            BillingType,
+            AdmissionDate,
+            DischargeDate,
+
+            TransactionCode,
+            TransactionDescription,
+            TransactionAmount,
+
+            [Status],
+            RecoveryTakeback,
+            DaysFromAdmission,
+            IncludeExclude,
+            PriorTransaction
+        )
+        EXEC RCA_Phys_Code.Analysis.pr_AR059_BadDebtAndInactiveAccountRecoveryPayments
+            @FacilityIDs     = @FacilityIDs,
+            @PeriodID        = @PeriodID,
+            @EndPeriodID     = @EndPeriodID,
+            @InOutTypes      = @InOutTypes,
+            @Username        = @Username,
+            @RAC             = @RAC,
+            @ExcludeAccounts = @ExcludeAccounts,
+            @Status          = @Status,
+            @PayorType       = @PayorType,
+            @PayorCodes      = @PayorCodes,
+            @SystemType      = @SystemType,
+            @UDFilter1       = @UDFilter1,
+            @DaysThreshold   = @DaysThreshold,
+            @AuthMode        = @AuthMode;
+
+
+        ----------------------------------------------------
+        -- Count returned and included records
+        ----------------------------------------------------
+
+        SELECT
+            @ReturnedRecordCount = COUNT_BIG(1)
+        FROM #AR059Stage;
+
+
+        SELECT
+            @IncludeDaysMetCount = COUNT_BIG(1)
+        FROM #AR059Stage
+        WHERE IncludeExclude = 'Include Days Met';
+
+
+        ----------------------------------------------------
+        -- Save included transaction detail
+        ----------------------------------------------------
+
+        INSERT INTO #AR059GroupDetail
+        (
+            RangeOrder,
+            RangeLabel,
+            AnalysisPeriodID,
+            ActivityThroughPeriodID,
+
+            GroupCategoryID,
+            GroupCategoryName,
+
+            Specialty,
+            AU,
+
+            MappedFacilityID,
+            MappedFacilityCode,
+            MappedFacilityName,
+
+            FacilityID,
+            FacilityName,
+            InOutType,
+            AccountNumber,
+
+            SIPGCode,
+            SIPGName,
+
+            FCCode,
+            FCName,
+
+            IPCode,
+            IPName,
+
+            PostingDate,
+            BillingType,
+            AdmissionDate,
+            DischargeDate,
+
+            TransactionCode,
+            TransactionDescription,
+            TransactionAmount,
+
+            [Status],
+            RecoveryTakeback,
+            DaysFromAdmission,
+            IncludeExclude,
+            PriorTransaction
+        )
+        SELECT
+            @RangeOrder,
+            @RangeLabel,
+            @PeriodID,
+            @EndPeriodID,
+
+            GM.GroupCategoryID,
+            GM.GroupCategoryName,
+
+            GM.Specialty,
+            GM.AU,
+
+            GM.FacilityID,
+            GM.FacilityCode,
+            GM.FacilityName,
+
+            AR.FacilityID,
+            AR.FacilityName,
+            AR.InOutType,
+            AR.AccountNumber,
+
+            AR.SIPGCode,
+            AR.SIPGName,
+
+            AR.FCCode,
+            AR.FCName,
+
+            AR.IPCode,
+            AR.IPName,
+
+            AR.PostingDate,
+            AR.BillingType,
+            AR.AdmissionDate,
+            AR.DischargeDate,
+
+            AR.TransactionCode,
+            AR.TransactionDescription,
+            AR.TransactionAmount,
+
+            AR.[Status],
+            AR.RecoveryTakeback,
+            AR.DaysFromAdmission,
+            AR.IncludeExclude,
+            AR.PriorTransaction
+
+        FROM #AR059Stage AS AR
+
+        INNER JOIN #GroupFacilityMapping AS GM
+            ON GM.FacilityID = AR.FacilityID
+
+        WHERE AR.IncludeExclude = 'Include Days Met';
+
+        SET @FinalDetailCount = @@ROWCOUNT;
+
+
+        ----------------------------------------------------
+        -- Log successful range
+        ----------------------------------------------------
+
+        INSERT INTO #AR059RunLog
+        (
+            RangeOrder,
+            RangeLabel,
+            AnalysisPeriodID,
+            ActivityThroughPeriodID,
+
+            GroupCategoryID,
+            GroupCategoryName,
+
+            FacilityCount,
+            ReturnedRecordCount,
+            IncludeDaysMetCount,
+            FinalDetailCount,
+
+            RunStatus,
+            ErrorNumber,
+            ErrorLine,
+            ErrorMessage
+        )
+        VALUES
+        (
+            @RangeOrder,
+            @RangeLabel,
+            @PeriodID,
+            @EndPeriodID,
+
+            @GroupCategoryID,
+            @GroupCategoryName,
+
+            @FacilityCount,
+            @ReturnedRecordCount,
+            @IncludeDaysMetCount,
+            @FinalDetailCount,
+
+            'Completed',
+            NULL,
+            NULL,
+            NULL
+        );
+
+    END TRY
+
+    BEGIN CATCH
+
+        ----------------------------------------------------
+        -- Log error and continue to the next range
+        ----------------------------------------------------
+
+        INSERT INTO #AR059RunLog
+        (
+            RangeOrder,
+            RangeLabel,
+            AnalysisPeriodID,
+            ActivityThroughPeriodID,
+
+            GroupCategoryID,
+            GroupCategoryName,
+
+            FacilityCount,
+            ReturnedRecordCount,
+            IncludeDaysMetCount,
+            FinalDetailCount,
+
+            RunStatus,
+            ErrorNumber,
+            ErrorLine,
+            ErrorMessage
+        )
+        VALUES
+        (
+            @RangeOrder,
+            @RangeLabel,
+            @PeriodID,
+            @EndPeriodID,
+
+            @GroupCategoryID,
+            @GroupCategoryName,
+
+            @FacilityCount,
+            0,
+            0,
+            0,
+
+            'Error',
+            ERROR_NUMBER(),
+            ERROR_LINE(),
+            ERROR_MESSAGE()
+        );
+
+    END CATCH;
+
+
+    SET @RangeOrder = @RangeOrder + 1;
+
+END;
+
+
+------------------------------------------------------------
+-- 16) SIX-RANGE OVERALL SUMMARY
+------------------------------------------------------------
+
+SELECT
+    RangeOrder,
+    RangeLabel,
+    AnalysisPeriodID,
+    ActivityThroughPeriodID,
+
+    GroupCategoryID,
+    GroupCategoryName,
+
+    COUNT_BIG(1) AS TransactionRowCount,
+    COUNT(DISTINCT AccountNumber) AS DistinctAccountCount,
+
+    SUM
+    (
+        CASE
+            WHEN RecoveryTakeback = 'Net Recovery'
+            THEN TransactionAmount
+            ELSE 0
+        END
+    ) AS NetRecoveryAmount,
+
+    SUM
+    (
+        CASE
+            WHEN RecoveryTakeback = 'Net Takeback'
+            THEN TransactionAmount
+            ELSE 0
+        END
+    ) AS NetTakebackAmount,
+
+    SUM(TransactionAmount) AS NetAmount
+
+FROM #AR059GroupDetail
+
+GROUP BY
+    RangeOrder,
+    RangeLabel,
+    AnalysisPeriodID,
+    ActivityThroughPeriodID,
+    GroupCategoryID,
+    GroupCategoryName
+
+ORDER BY
+    RangeOrder;
+
+
+------------------------------------------------------------
+-- 17) RANGE AND SPECIALTY SUMMARY
+------------------------------------------------------------
+
+SELECT
+    RangeOrder,
+    RangeLabel,
+    AnalysisPeriodID,
+    ActivityThroughPeriodID,
+
+    GroupCategoryID,
+    GroupCategoryName,
+
+    Specialty,
+
+    COUNT_BIG(1) AS TransactionRowCount,
+    COUNT(DISTINCT AccountNumber) AS DistinctAccountCount,
+
+    SUM
+    (
+        CASE
+            WHEN RecoveryTakeback = 'Net Recovery'
+            THEN TransactionAmount
+            ELSE 0
+        END
+    ) AS NetRecoveryAmount,
+
+    SUM
+    (
+        CASE
+            WHEN RecoveryTakeback = 'Net Takeback'
+            THEN TransactionAmount
+            ELSE 0
+        END
+    ) AS NetTakebackAmount,
+
+    SUM(TransactionAmount) AS NetAmount
+
+FROM #AR059GroupDetail
+
+GROUP BY
+    RangeOrder,
+    RangeLabel,
+    AnalysisPeriodID,
+    ActivityThroughPeriodID,
+    GroupCategoryID,
+    GroupCategoryName,
+    Specialty
+
+ORDER BY
+    RangeOrder,
+    Specialty;
+
+
+------------------------------------------------------------
+-- 18) RANGE, SPECIALTY, AND AU SUMMARY
+------------------------------------------------------------
+
+SELECT
+    RangeOrder,
+    RangeLabel,
+    AnalysisPeriodID,
+    ActivityThroughPeriodID,
+
+    GroupCategoryID,
+    GroupCategoryName,
+
+    Specialty,
+    AU,
+
+    COUNT_BIG(1) AS TransactionRowCount,
+    COUNT(DISTINCT AccountNumber) AS DistinctAccountCount,
+
+    SUM
+    (
+        CASE
+            WHEN RecoveryTakeback = 'Net Recovery'
+            THEN TransactionAmount
+            ELSE 0
+        END
+    ) AS NetRecoveryAmount,
+
+    SUM
+    (
+        CASE
+            WHEN RecoveryTakeback = 'Net Takeback'
+            THEN TransactionAmount
+            ELSE 0
+        END
+    ) AS NetTakebackAmount,
+
+    SUM(TransactionAmount) AS NetAmount
+
+FROM #AR059GroupDetail
+
+GROUP BY
+    RangeOrder,
+    RangeLabel,
+    AnalysisPeriodID,
+    ActivityThroughPeriodID,
+    GroupCategoryID,
+    GroupCategoryName,
+    Specialty,
+    AU
+
+ORDER BY
+    RangeOrder,
+    Specialty,
+    AU;
+
+
+------------------------------------------------------------
+-- 19) FINANCIAL CLASS SUMMARY
+------------------------------------------------------------
+
+SELECT
+    RangeOrder,
+    RangeLabel,
+    AnalysisPeriodID,
+    ActivityThroughPeriodID,
+
+    Specialty,
+
+    FCCode AS FinancialClassCode,
+    FCName AS FinancialClass,
+
+    RecoveryTakeback,
+
+    COUNT_BIG(1) AS TransactionRowCount,
+    COUNT(DISTINCT AccountNumber) AS DistinctAccountCount,
+    SUM(TransactionAmount) AS TotalTransactionAmount
+
+FROM #AR059GroupDetail
+
+GROUP BY
+    RangeOrder,
+    RangeLabel,
+    AnalysisPeriodID,
+    ActivityThroughPeriodID,
+    Specialty,
+    FCCode,
+    FCName,
+    RecoveryTakeback
+
+ORDER BY
+    RangeOrder,
+    Specialty,
+    FCName,
+    RecoveryTakeback;
+
+
+------------------------------------------------------------
+-- 20) RUN LOG
+--
+-- All six ranges should show Completed.
+------------------------------------------------------------
+
+SELECT
+    RangeOrder,
+    RangeLabel,
+    AnalysisPeriodID,
+    ActivityThroughPeriodID,
+
+    FacilityCount,
+    ReturnedRecordCount,
+    IncludeDaysMetCount,
+    FinalDetailCount,
+
+    RunStatus,
+    ErrorNumber,
+    ErrorLine,
+    ErrorMessage
+
+FROM #AR059RunLog
+
+ORDER BY
+    RangeOrder;
+
+
+------------------------------------------------------------
+-- 21) COMPLETE TRANSACTION DETAIL
+--
+-- This is the full result to export.
+------------------------------------------------------------
+
+SELECT
+    RangeOrder,
+    RangeLabel,
+    AnalysisPeriodID,
+    ActivityThroughPeriodID,
+    Specialty,
+    AU,
+
+    MappedFacilityID,
+    MappedFacilityCode,
+    MappedFacilityName,
+
+    FacilityID,
+    FacilityName,
+    InOutType,
+    AccountNumber,
+
+    RecoveryTakeback,
+    PostingDate,
+
+    TransactionCode,
+    TransactionDescription,
+    TransactionAmount,
+
+    SIPGCode,
+    SIPGName,
+
+    FCCode,
+    FCName,
+
+    IPCode,
+    IPName,
+
+    BillingType,
+    AdmissionDate,
+    DischargeDate,
+
+    [Status],
+    DaysFromAdmission,
+    IncludeExclude,
+    PriorTransaction
+
+FROM #AR059GroupDetail
+
+ORDER BY
+    RangeOrder,
+    Specialty,
+    AU,
+    FacilityName,
+    AccountNumber,
+    PostingDate,
+    TransactionCode;
+
