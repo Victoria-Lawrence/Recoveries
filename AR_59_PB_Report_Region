@@ -1,4 +1,3 @@
-
 USE [RCA_Phys_Code];
 GO
 
@@ -7,15 +6,34 @@ SET XACT_ABORT ON;
 
 
 /*==============================================================
-  HTPN WO&M AR059 RECOVERY DETAIL
-  Report Group Selection:
-      GroupCategoryID = 1018
 
-  This version:
-      1. Uses the HTPN WO&M report-group facility mapping.
-      2. Retains Specialty and AU from Facility Structure.
-      3. Runs the existing AR059 procedure for six ranges.
-      4. Returns summary, diagnostics, and complete detail.
+ PB AR059 RECOVERY DETAIL BY REPORT REGION
+
+ Report Region examples:
+
+     Austin
+     Brenham
+     College Station
+     Hill Country
+     HPS
+     HTPN WO&M
+     HTPN JV
+     Marble Falls
+     Temple
+     Round Rock
+     etc.
+
+ This version:
+
+ 1. Loads the authorized PB facility structure.
+ 2. Defines the verified PB Report Region GroupCategoryIDs.
+ 3. Maps every authorized PB facility to Report Region.
+ 4. Retains Specialty and AU from Facility Structure.
+ 5. Prevents duplicate Report Region assignment.
+ 6. Runs the existing PB AR059 procedure for six ranges.
+ 7. Returns Report Region summaries and complete detail.
+ 8. Captures unmapped AR059 facility diagnostics.
+
 ==============================================================*/
 
 
@@ -25,34 +43,130 @@ SET XACT_ABORT ON;
 
 DECLARE @Username VARCHAR(50) = 'BHCS\vstevens';
 
-DECLARE @GroupCategoryID INT = 1018;
-DECLARE @GroupCategoryName VARCHAR(128);
-
 DECLARE @InOutTypes VARCHAR(20) = 'Outpatient';
+
 DECLARE @RAC INT = 1;
+
 DECLARE @ExcludeAccounts INT = 0;
+
 DECLARE @Status VARCHAR(20) = 'BAD DEBT,INACTIVE';
+
 DECLARE @PayorType VARCHAR(31) = 'Financial Class';
 
 /*
-    NULL means all financial classes/payors.
+NULL means all financial classes/payors.
 */
 DECLARE @PayorCodes VARCHAR(MAX) = NULL;
 
 DECLARE @SystemType VARCHAR(MAX) = NULL;
+
 DECLARE @UDFilter1 VARCHAR(MAX) = NULL;
+
 DECLARE @DaysThreshold INT = 30;
+
 DECLARE @AuthMode VARCHAR(10) = 'AD';
 
 
 ------------------------------------------------------------
--- 2) SIX RECOVERY RANGES
+-- 2) VERIFIED PB REPORT REGION GROUP CATEGORIES
+--
+-- These are the Report Region values verified in:
+--
+-- Analysis.dimGroupCategory
+--
+-- The lower-numbered categories such as Acute, Rural,
+-- Urban, and facility-size groups are intentionally excluded.
+------------------------------------------------------------
+
+DECLARE @ReportRegions TABLE
+(
+    ReportRegionID INT NOT NULL PRIMARY KEY,
+    ExpectedReportRegion VARCHAR(128) NOT NULL
+);
+
+INSERT INTO @ReportRegions
+(
+    ReportRegionID,
+    ExpectedReportRegion
+)
+VALUES
+    (1000, 'Austin'),
+    (1001, 'Brenham'),
+    (1002, 'College Station'),
+    (1003, 'Hill Country'),
+    (1004, 'HPS'),
+    (1005, 'Llano'),
+    (1006, 'Round Rock'),
+    (1007, 'Taylor'),
+    (1008, 'Temple'),
+    (1009, 'Temple Pedi'),
+    (1014, 'Unapplied'),
+    (1015, 'HFHC'),
+    (1016, 'BAS'),
+    (1017, 'Marble Falls'),
+    (1018, 'HTPN WO&M'),
+    (1019, 'HTPN JV'),
+    (1020, 'BAEC'),
+    (1021, 'HTPN Unapplied'),
+    (1022, 'THHBP'),
+    (1023, 'CIP'),
+    (1024, 'HTPN DME'),
+    (1025, 'Ortho TX');
+
+
+------------------------------------------------------------
+-- 3) VALIDATE REPORT REGION DEFINITIONS
+--
+-- This ensures that the IDs still exist and that their
+-- names match the verified Report Region names.
+------------------------------------------------------------
+
+IF EXISTS
+(
+    SELECT 1
+    FROM @ReportRegions AS RR
+
+    LEFT JOIN Analysis.dimGroupCategory AS GC
+        ON GC.GroupCategoryID = RR.ReportRegionID
+
+    WHERE GC.GroupCategoryID IS NULL
+       OR LTRIM(RTRIM(GC.GroupCategoryName))
+            <> RR.ExpectedReportRegion
+)
+BEGIN
+
+    SELECT
+        RR.ReportRegionID,
+        RR.ExpectedReportRegion,
+        GC.GroupCategoryName AS CurrentGroupCategoryName
+
+    FROM @ReportRegions AS RR
+
+    LEFT JOIN Analysis.dimGroupCategory AS GC
+        ON GC.GroupCategoryID = RR.ReportRegionID
+
+    WHERE GC.GroupCategoryID IS NULL
+       OR LTRIM(RTRIM(GC.GroupCategoryName))
+            <> RR.ExpectedReportRegion
+
+    ORDER BY
+        RR.ReportRegionID;
+
+    THROW 50001,
+        'One or more PB Report Region IDs are missing or have a different name.',
+        1;
+
+END;
+
+
+------------------------------------------------------------
+-- 4) SIX RECOVERY RANGES
 --
 -- AnalysisPeriodID:
---     Analysis Date selected in Crowe
+-- Analysis Date selected in Crowe
 --
 -- ActivityThroughPeriodID:
---     Activity Through date selected in Crowe
+-- Activity Through date selected in Crowe
 ------------------------------------------------------------
 
 DECLARE @Ranges TABLE
@@ -75,12 +189,12 @@ VALUES
     (2, 'Range 2', 20250630, 20260630),
     (3, 'Range 3', 20250531, 20260531),
     (4, 'Range 4', 20250430, 20260430),
-    (5, 'Range 5', 20250930, 20260930),
+    (5, 'Range 5', 20250331, 20260331),
     (6, 'Range 6', 20250831, 20260831);
 
 
 ------------------------------------------------------------
--- 3) VALIDATE RANGE DATES
+-- 5) VALIDATE RANGE DATES
 ------------------------------------------------------------
 
 IF EXISTS
@@ -90,31 +204,16 @@ IF EXISTS
     WHERE AnalysisPeriodID >= ActivityThroughPeriodID
 )
 BEGIN
-    THROW 50001,
-          'Each Analysis Period must be earlier than its Activity Through Period.',
-          1;
-END;
 
-
-------------------------------------------------------------
--- 4) GET REPORT-GROUP NAME
-------------------------------------------------------------
-
-SELECT
-    @GroupCategoryName = GC.GroupCategoryName
-FROM Analysis.dimGroupCategory AS GC
-WHERE GC.GroupCategoryID = @GroupCategoryID;
-
-IF @GroupCategoryName IS NULL
-BEGIN
     THROW 50002,
-          'GroupCategoryID 1018 was not found in Analysis.dimGroupCategory.',
-          1;
+        'Each Analysis Period must be earlier than its Activity Through Period.',
+        1;
+
 END;
 
 
 ------------------------------------------------------------
--- 5) LOAD AUTHORIZED FACILITY STRUCTURE
+-- 6) LOAD AUTHORIZED PB FACILITY STRUCTURE
 ------------------------------------------------------------
 
 IF OBJECT_ID('tempdb..#FacilityStructure') IS NOT NULL
@@ -161,111 +260,92 @@ EXEC RCA_Phys_Code.Analysis.p_MappingDataFacilityStructure
 
 
 ------------------------------------------------------------
--- 6) CREATE HTPN WO&M REPORT-GROUP FACILITY MAPPING
-------------------------------------------------------------
-
-IF OBJECT_ID('tempdb..#GroupFacilities') IS NOT NULL
-    DROP TABLE #GroupFacilities;
-
-CREATE TABLE #GroupFacilities
-(
-    GroupCategoryID INT NOT NULL,
-    GroupCategoryName VARCHAR(128) NULL,
-    Specialty VARCHAR(128) NULL,
-    AU VARCHAR(9) NULL,
-    FacilityID INT NOT NULL,
-    FacilityCode VARCHAR(100) NULL,
-    FacilityName VARCHAR(255) NULL
-);
-
-INSERT INTO #GroupFacilities
-(
-    GroupCategoryID,
-    GroupCategoryName,
-    Specialty,
-    AU,
-    FacilityID,
-    FacilityCode,
-    FacilityName
-)
-SELECT DISTINCT
-    @GroupCategoryID,
-    @GroupCategoryName,
-    LTRIM(RTRIM(FS.FacilityName2)),
-    LEFT(LTRIM(FS.FacilityName1), 9),
-    FS.FacilityID1,
-    FS.FacilityCode1,
-    FS.FacilityName1
-FROM Analysis.FacilityGroup AS FG
-INNER JOIN #FacilityStructure AS FS
-    ON FS.FacilityID1 = FG.FacilityID
-WHERE FG.GroupCategoryID = @GroupCategoryID
-  AND FS.FacilityID1 IS NOT NULL;
-
-
-------------------------------------------------------------
--- 7) VERIFY REPORT-GROUP FACILITIES
+-- 7) VERIFY AUTHORIZED PB FACILITIES EXIST
 ------------------------------------------------------------
 
 IF NOT EXISTS
 (
     SELECT 1
-    FROM #GroupFacilities
+    FROM #FacilityStructure
+    WHERE FacilityID1 IS NOT NULL
 )
 BEGIN
+
     THROW 50003,
-          'No authorized facilities were found for GroupCategoryID 1018.',
-          1;
+        'No authorized PB facilities were returned for the selected username.',
+        1;
+
 END;
 
 
 ------------------------------------------------------------
--- 8) CREATE ONE MAPPING ROW PER FACILITY
+-- 8) CREATE AUTHORIZED PB FACILITY LIST
 --
--- This prevents AR059 rows from duplicating if FacilityGroup or
--- FacilityStructure contains duplicate mappings.
+-- One row per authorized FacilityID1.
+--
+-- Specialty is retained from FacilityName2.
+-- AU follows the logic from the original PB query.
 ------------------------------------------------------------
 
-IF OBJECT_ID('tempdb..#GroupFacilityMapping') IS NOT NULL
-    DROP TABLE #GroupFacilityMapping;
+IF OBJECT_ID('tempdb..#AuthorizedPBFacilities') IS NOT NULL
+    DROP TABLE #AuthorizedPBFacilities;
 
-CREATE TABLE #GroupFacilityMapping
+CREATE TABLE #AuthorizedPBFacilities
 (
-    GroupCategoryID INT NOT NULL,
-    GroupCategoryName VARCHAR(128) NULL,
     Specialty VARCHAR(128) NULL,
     AU VARCHAR(9) NULL,
+
     FacilityID INT NOT NULL,
     FacilityCode VARCHAR(100) NULL,
     FacilityName VARCHAR(255) NULL
 );
 
-;WITH RankedFacilityMapping AS
+;WITH RankedAuthorizedFacilities AS
 (
     SELECT
-        GF.GroupCategoryID,
-        GF.GroupCategoryName,
-        GF.Specialty,
-        GF.AU,
-        GF.FacilityID,
-        GF.FacilityCode,
-        GF.FacilityName,
+        NULLIF
+        (
+            LTRIM(RTRIM(FS.FacilityName2)),
+            ''
+        ) AS Specialty,
+
+        LEFT
+        (
+            LTRIM(RTRIM(FS.FacilityName1)),
+            9
+        ) AS AU,
+
+        FS.FacilityID1 AS FacilityID,
+        FS.FacilityCode1 AS FacilityCode,
+        FS.FacilityName1 AS FacilityName,
 
         ROW_NUMBER() OVER
         (
-            PARTITION BY GF.FacilityID
-            ORDER BY
-                GF.Specialty,
-                GF.FacilityName,
-                GF.FacilityCode
-        ) AS MappingRow
+            PARTITION BY FS.FacilityID1
 
-    FROM #GroupFacilities AS GF
+            ORDER BY
+                CASE
+                    WHEN NULLIF
+                    (
+                        LTRIM(RTRIM(FS.FacilityName2)),
+                        ''
+                    ) IS NULL
+                    THEN 1
+                    ELSE 0
+                END,
+
+                FS.FacilityName2,
+                FS.FacilityName1,
+                FS.FacilityCode1
+
+        ) AS FacilityRow
+
+    FROM #FacilityStructure AS FS
+
+    WHERE FS.FacilityID1 IS NOT NULL
 )
-INSERT INTO #GroupFacilityMapping
+INSERT INTO #AuthorizedPBFacilities
 (
-    GroupCategoryID,
-    GroupCategoryName,
     Specialty,
     AU,
     FacilityID,
@@ -273,23 +353,294 @@ INSERT INTO #GroupFacilityMapping
     FacilityName
 )
 SELECT
-    GroupCategoryID,
-    GroupCategoryName,
     Specialty,
     AU,
     FacilityID,
     FacilityCode,
     FacilityName
-FROM RankedFacilityMapping
-WHERE MappingRow = 1;
+
+FROM RankedAuthorizedFacilities
+
+WHERE FacilityRow = 1;
 
 
 ------------------------------------------------------------
--- 9) BUILD COMMA-SEPARATED FACILITY LIST
+-- 9) CREATE REPORT REGION FACILITY CANDIDATES
+--
+-- This joins:
+--
+-- Authorized Facility
+--     to Analysis.FacilityGroup
+--     to the verified Report Region list
+--     to Analysis.dimGroupCategory
+------------------------------------------------------------
+
+IF OBJECT_ID('tempdb..#ReportRegionCandidates') IS NOT NULL
+    DROP TABLE #ReportRegionCandidates;
+
+CREATE TABLE #ReportRegionCandidates
+(
+    ReportRegionID INT NOT NULL,
+    ReportRegion VARCHAR(128) NOT NULL,
+
+    Specialty VARCHAR(128) NULL,
+    AU VARCHAR(9) NULL,
+
+    FacilityID INT NOT NULL,
+    FacilityCode VARCHAR(100) NULL,
+    FacilityName VARCHAR(255) NULL
+);
+
+INSERT INTO #ReportRegionCandidates
+(
+    ReportRegionID,
+    ReportRegion,
+
+    Specialty,
+    AU,
+
+    FacilityID,
+    FacilityCode,
+    FacilityName
+)
+SELECT DISTINCT
+    GC.GroupCategoryID AS ReportRegionID,
+    LTRIM(RTRIM(GC.GroupCategoryName)) AS ReportRegion,
+
+    APB.Specialty,
+    APB.AU,
+
+    APB.FacilityID,
+    APB.FacilityCode,
+    APB.FacilityName
+
+FROM #AuthorizedPBFacilities AS APB
+
+INNER JOIN Analysis.FacilityGroup AS FG
+    ON FG.FacilityID = APB.FacilityID
+
+INNER JOIN @ReportRegions AS RR
+    ON RR.ReportRegionID = FG.GroupCategoryID
+
+INNER JOIN Analysis.dimGroupCategory AS GC
+    ON GC.GroupCategoryID = FG.GroupCategoryID;
+
+
+------------------------------------------------------------
+-- 10) AUTHORIZED FACILITIES WITHOUT REPORT REGION
+--
+-- These facilities are authorized for the selected username
+-- but are not assigned to one of the verified Report Regions.
+--
+-- The result is returned now for review. These facilities
+-- are not passed into AR059 by this version.
+------------------------------------------------------------
+
+IF OBJECT_ID('tempdb..#FacilitiesWithoutReportRegion') IS NOT NULL
+    DROP TABLE #FacilitiesWithoutReportRegion;
+
+CREATE TABLE #FacilitiesWithoutReportRegion
+(
+    Specialty VARCHAR(128) NULL,
+    AU VARCHAR(9) NULL,
+
+    FacilityID INT NOT NULL,
+    FacilityCode VARCHAR(100) NULL,
+    FacilityName VARCHAR(255) NULL
+);
+
+INSERT INTO #FacilitiesWithoutReportRegion
+(
+    Specialty,
+    AU,
+
+    FacilityID,
+    FacilityCode,
+    FacilityName
+)
+SELECT
+    APB.Specialty,
+    APB.AU,
+
+    APB.FacilityID,
+    APB.FacilityCode,
+    APB.FacilityName
+
+FROM #AuthorizedPBFacilities AS APB
+
+LEFT JOIN #ReportRegionCandidates AS RRC
+    ON RRC.FacilityID = APB.FacilityID
+
+WHERE RRC.FacilityID IS NULL;
+
+
+------------------------------------------------------------
+-- 11) CHECK FOR MULTIPLE REPORT REGION ASSIGNMENTS
+--
+-- A facility mapped to multiple Report Regions would cause
+-- duplicate AR059 detail rows after the mapping join.
+--
+-- The script stops rather than selecting a region
+-- arbitrarily.
+------------------------------------------------------------
+
+IF OBJECT_ID('tempdb..#MultipleReportRegionFacilities') IS NOT NULL
+    DROP TABLE #MultipleReportRegionFacilities;
+
+CREATE TABLE #MultipleReportRegionFacilities
+(
+    FacilityID INT NOT NULL,
+    FacilityCode VARCHAR(100) NULL,
+    FacilityName VARCHAR(255) NULL,
+    ReportRegionCount INT NOT NULL,
+    ReportRegionList VARCHAR(MAX) NULL
+);
+
+INSERT INTO #MultipleReportRegionFacilities
+(
+    FacilityID,
+    FacilityCode,
+    FacilityName,
+    ReportRegionCount,
+    ReportRegionList
+)
+SELECT
+    RRC.FacilityID,
+    MAX(RRC.FacilityCode) AS FacilityCode,
+    MAX(RRC.FacilityName) AS FacilityName,
+
+    COUNT(DISTINCT RRC.ReportRegionID) AS ReportRegionCount,
+
+    STUFF
+    (
+        (
+            SELECT DISTINCT
+                ', ' + RRC2.ReportRegion
+
+            FROM #ReportRegionCandidates AS RRC2
+
+            WHERE RRC2.FacilityID = RRC.FacilityID
+
+            ORDER BY
+                ', ' + RRC2.ReportRegion
+
+            FOR XML PATH(''), TYPE
+        ).value('.', 'VARCHAR(MAX)'),
+        1,
+        2,
+        ''
+    ) AS ReportRegionList
+
+FROM #ReportRegionCandidates AS RRC
+
+GROUP BY
+    RRC.FacilityID
+
+HAVING COUNT(DISTINCT RRC.ReportRegionID) > 1;
+
+
+IF EXISTS
+(
+    SELECT 1
+    FROM #MultipleReportRegionFacilities
+)
+BEGIN
+
+    SELECT
+        FacilityID,
+        FacilityCode,
+        FacilityName,
+        ReportRegionCount,
+        ReportRegionList
+
+    FROM #MultipleReportRegionFacilities
+
+    ORDER BY
+        FacilityName,
+        FacilityID;
+
+    THROW 50004,
+        'One or more PB facilities are assigned to multiple Report Regions. Review the diagnostic result before running AR059.',
+        1;
+
+END;
+
+
+------------------------------------------------------------
+-- 12) CREATE FINAL ONE-ROW-PER-FACILITY MAPPING
+------------------------------------------------------------
+
+IF OBJECT_ID('tempdb..#PBReportRegionMapping') IS NOT NULL
+    DROP TABLE #PBReportRegionMapping;
+
+CREATE TABLE #PBReportRegionMapping
+(
+    ReportRegionID INT NOT NULL,
+    ReportRegion VARCHAR(128) NOT NULL,
+
+    Specialty VARCHAR(128) NULL,
+    AU VARCHAR(9) NULL,
+
+    FacilityID INT NOT NULL,
+    FacilityCode VARCHAR(100) NULL,
+    FacilityName VARCHAR(255) NULL
+);
+
+INSERT INTO #PBReportRegionMapping
+(
+    ReportRegionID,
+    ReportRegion,
+
+    Specialty,
+    AU,
+
+    FacilityID,
+    FacilityCode,
+    FacilityName
+)
+SELECT
+    RRC.ReportRegionID,
+    RRC.ReportRegion,
+
+    RRC.Specialty,
+    RRC.AU,
+
+    RRC.FacilityID,
+    RRC.FacilityCode,
+    RRC.FacilityName
+
+FROM #ReportRegionCandidates AS RRC;
+
+
+------------------------------------------------------------
+-- 13) VERIFY REPORT REGION FACILITIES
+------------------------------------------------------------
+
+IF NOT EXISTS
+(
+    SELECT 1
+    FROM #PBReportRegionMapping
+)
+BEGIN
+
+    THROW 50005,
+        'No authorized PB facilities were found for the verified Report Region groups.',
+        1;
+
+END;
+
+
+------------------------------------------------------------
+-- 14) BUILD COMMA-SEPARATED FACILITY LIST
 ------------------------------------------------------------
 
 DECLARE @FacilityIDs VARCHAR(MAX);
+
 DECLARE @FacilityCount INT;
+
+DECLARE @ReportRegionCount INT;
+
+DECLARE @SpecialtyCount INT;
 
 SELECT
     @FacilityIDs =
@@ -298,46 +649,129 @@ SELECT
             (
                 SELECT
                     ',' + CAST(F.FacilityID AS VARCHAR(20))
+
                 FROM
                 (
                     SELECT DISTINCT
                         FacilityID
-                    FROM #GroupFacilityMapping
+
+                    FROM #PBReportRegionMapping
                 ) AS F
+
                 ORDER BY
                     F.FacilityID
+
                 FOR XML PATH(''), TYPE
+
             ).value('.', 'VARCHAR(MAX)'),
+
             1,
             1,
             ''
         );
 
+
 SELECT
-    @FacilityCount = COUNT(DISTINCT FacilityID)
-FROM #GroupFacilityMapping;
+    @FacilityCount =
+        COUNT(DISTINCT FacilityID),
+
+    @ReportRegionCount =
+        COUNT(DISTINCT ReportRegionID),
+
+    @SpecialtyCount =
+        COUNT
+        (
+            DISTINCT CASE
+                WHEN Specialty IS NOT NULL
+                THEN Specialty
+            END
+        )
+
+FROM #PBReportRegionMapping;
+
 
 IF NULLIF(LTRIM(RTRIM(@FacilityIDs)), '') IS NULL
 BEGIN
-    THROW 50004,
-          'The HTPN WO&M FacilityID list is empty.',
-          1;
+
+    THROW 50006,
+        'The PB Report Region FacilityID list is empty.',
+        1;
+
 END;
 
 
 ------------------------------------------------------------
--- 10) FACILITY VALIDATION
+-- 15) REPORT REGION MAPPING VALIDATION
 ------------------------------------------------------------
 
 SELECT
-    GroupCategoryID,
-    GroupCategoryName,
+    ReportRegionID,
+    ReportRegion,
+
     Specialty,
     AU,
+
     FacilityID,
     FacilityCode,
     FacilityName
-FROM #GroupFacilityMapping
+
+FROM #PBReportRegionMapping
+
+ORDER BY
+    ReportRegion,
+    Specialty,
+    AU,
+    FacilityName,
+    FacilityID;
+
+
+------------------------------------------------------------
+-- 16) REPORT REGION FACILITY COUNTS
+------------------------------------------------------------
+
+SELECT
+    ReportRegionID,
+    ReportRegion,
+
+    COUNT(DISTINCT FacilityID) AS FacilityCount,
+
+    COUNT
+    (
+        DISTINCT CASE
+            WHEN Specialty IS NOT NULL
+            THEN Specialty
+        END
+    ) AS SpecialtyCount
+
+FROM #PBReportRegionMapping
+
+GROUP BY
+    ReportRegionID,
+    ReportRegion
+
+ORDER BY
+    ReportRegion;
+
+
+------------------------------------------------------------
+-- 17) AUTHORIZED FACILITIES WITHOUT REPORT REGION
+--
+-- Review this result carefully.
+--
+-- An empty result means every authorized PB facility was
+-- assigned to one of the verified Report Regions.
+------------------------------------------------------------
+
+SELECT
+    Specialty,
+    AU,
+
+    FacilityID,
+    FacilityCode,
+    FacilityName
+
+FROM #FacilitiesWithoutReportRegion
+
 ORDER BY
     Specialty,
     AU,
@@ -345,18 +779,34 @@ ORDER BY
     FacilityID;
 
 
+------------------------------------------------------------
+-- 18) OVERALL FACILITY SELECTION INFORMATION
+------------------------------------------------------------
+
 SELECT
-    @GroupCategoryID AS GroupCategoryID,
-    @GroupCategoryName AS GroupCategoryName,
+    'PB Report Region' AS ProcessingScope,
+
+    @ReportRegionCount AS ReportRegionCount,
+
+    @SpecialtyCount AS SpecialtyCount,
+
     @FacilityCount AS FacilityCount,
+
+    (
+        SELECT COUNT_BIG(1)
+        FROM #FacilitiesWithoutReportRegion
+    ) AS AuthorizedFacilitiesWithoutReportRegion,
+
     @FacilityIDs AS FacilityIDList;
 
 
 ------------------------------------------------------------
--- 11) CREATE AR059 STAGING TABLE
+-- 19) CREATE AR059 STAGING TABLE
 --
--- This must match the columns returned by:
--- Analysis.pr_AR059_BadDebtAndInactiveAccountRecoveryPayments
+-- This matches the columns returned by:
+--
+-- RCA_Phys_Code.Analysis.
+-- pr_AR059_BadDebtAndInactiveAccountRecoveryPayments
 ------------------------------------------------------------
 
 IF OBJECT_ID('tempdb..#AR059Stage') IS NOT NULL
@@ -366,6 +816,7 @@ CREATE TABLE #AR059Stage
 (
     FacilityID INT,
     FacilityName VARCHAR(256),
+
     InOutType VARCHAR(32),
     AccountNumber VARCHAR(256),
 
@@ -379,38 +830,46 @@ CREATE TABLE #AR059Stage
     IPName VARCHAR(256),
 
     PostingDate DATETIME,
+
     BillingType VARCHAR(50),
+
     AdmissionDate DATETIME,
     DischargeDate DATETIME,
 
     TransactionCode VARCHAR(50),
     TransactionDescription VARCHAR(256),
+
     TransactionAmount MONEY,
 
     [Status] VARCHAR(20),
+
     RecoveryTakeback VARCHAR(20),
+
     DaysFromAdmission INT,
+
     IncludeExclude VARCHAR(50),
+
     PriorTransaction VARCHAR(50)
 );
 
 
 ------------------------------------------------------------
--- 12) CREATE FINAL SIX-RANGE DETAIL TABLE
+-- 20) CREATE FINAL SIX-RANGE DETAIL TABLE
 ------------------------------------------------------------
 
-IF OBJECT_ID('tempdb..#AR059GroupDetail') IS NOT NULL
-    DROP TABLE #AR059GroupDetail;
+IF OBJECT_ID('tempdb..#AR059PBDetail') IS NOT NULL
+    DROP TABLE #AR059PBDetail;
 
-CREATE TABLE #AR059GroupDetail
+CREATE TABLE #AR059PBDetail
 (
     RangeOrder INT,
     RangeLabel VARCHAR(100),
+
     AnalysisPeriodID INT,
     ActivityThroughPeriodID INT,
 
-    GroupCategoryID INT,
-    GroupCategoryName VARCHAR(128),
+    ReportRegionID INT,
+    ReportRegion VARCHAR(128),
 
     Specialty VARCHAR(128),
     AU VARCHAR(9),
@@ -421,6 +880,7 @@ CREATE TABLE #AR059GroupDetail
 
     FacilityID INT,
     FacilityName VARCHAR(256),
+
     InOutType VARCHAR(32),
     AccountNumber VARCHAR(256),
 
@@ -434,24 +894,53 @@ CREATE TABLE #AR059GroupDetail
     IPName VARCHAR(256),
 
     PostingDate DATETIME,
+
     BillingType VARCHAR(50),
+
     AdmissionDate DATETIME,
     DischargeDate DATETIME,
 
     TransactionCode VARCHAR(50),
     TransactionDescription VARCHAR(256),
+
     TransactionAmount MONEY,
 
     [Status] VARCHAR(20),
+
     RecoveryTakeback VARCHAR(20),
+
     DaysFromAdmission INT,
+
     IncludeExclude VARCHAR(50),
+
     PriorTransaction VARCHAR(50)
 );
 
 
 ------------------------------------------------------------
--- 13) CREATE RUN LOG
+-- 21) CREATE UNMAPPED AR059 FACILITY DIAGNOSTIC TABLE
+------------------------------------------------------------
+
+IF OBJECT_ID('tempdb..#AR059UnmappedFacilities') IS NOT NULL
+    DROP TABLE #AR059UnmappedFacilities;
+
+CREATE TABLE #AR059UnmappedFacilities
+(
+    RangeOrder INT,
+    RangeLabel VARCHAR(100),
+
+    AnalysisPeriodID INT,
+    ActivityThroughPeriodID INT,
+
+    FacilityID INT,
+    FacilityName VARCHAR(256),
+
+    ReturnedRecordCount BIGINT
+);
+
+
+------------------------------------------------------------
+-- 22) CREATE RUN LOG
 ------------------------------------------------------------
 
 IF OBJECT_ID('tempdb..#AR059RunLog') IS NOT NULL
@@ -461,18 +950,21 @@ CREATE TABLE #AR059RunLog
 (
     RangeOrder INT,
     RangeLabel VARCHAR(100),
+
     AnalysisPeriodID INT,
     ActivityThroughPeriodID INT,
 
-    GroupCategoryID INT,
-    GroupCategoryName VARCHAR(128),
-
+    ReportRegionCount INT,
+    SpecialtyCount INT,
     FacilityCount INT,
+
     ReturnedRecordCount BIGINT,
     IncludeDaysMetCount BIGINT,
-    FinalDetailCount BIGINT,
+    MappedDetailCount BIGINT,
+    UnmappedDetailCount BIGINT,
 
     RunStatus VARCHAR(20),
+
     ErrorNumber INT NULL,
     ErrorLine INT NULL,
     ErrorMessage VARCHAR(4000) NULL
@@ -480,29 +972,27 @@ CREATE TABLE #AR059RunLog
 
 
 ------------------------------------------------------------
--- 14) DECLARE LOOP VARIABLES
+-- 23) DECLARE LOOP VARIABLES
 ------------------------------------------------------------
 
 DECLARE @RangeOrder INT;
 DECLARE @MaximumRangeOrder INT;
-
 DECLARE @RangeLabel VARCHAR(100);
 DECLARE @PeriodID INT;
 DECLARE @EndPeriodID INT;
 
 DECLARE @ReturnedRecordCount BIGINT;
 DECLARE @IncludeDaysMetCount BIGINT;
-DECLARE @FinalDetailCount BIGINT;
-
+DECLARE @MappedDetailCount BIGINT;
+DECLARE @UnmappedDetailCount BIGINT;
 
 SELECT
     @RangeOrder = MIN(RangeOrder),
     @MaximumRangeOrder = MAX(RangeOrder)
 FROM @Ranges;
 
-
 ------------------------------------------------------------
--- 15) RUN AR059 FOR EACH RANGE
+-- 24) RUN PB AR059 FOR EACH RANGE
 ------------------------------------------------------------
 
 WHILE @RangeOrder <= @MaximumRangeOrder
@@ -514,9 +1004,13 @@ BEGIN
 
     SELECT
         @RangeLabel = RangeLabel,
+
         @PeriodID = AnalysisPeriodID,
+
         @EndPeriodID = ActivityThroughPeriodID
+
     FROM @Ranges
+
     WHERE RangeOrder = @RangeOrder;
 
 
@@ -527,20 +1021,25 @@ BEGIN
     TRUNCATE TABLE #AR059Stage;
 
     SET @ReturnedRecordCount = 0;
+
     SET @IncludeDaysMetCount = 0;
-    SET @FinalDetailCount = 0;
+
+    SET @MappedDetailCount = 0;
+
+    SET @UnmappedDetailCount = 0;
 
 
     BEGIN TRY
 
         ----------------------------------------------------
-        -- Run the existing AR059 stored procedure
+        -- Run PB AR059
         ----------------------------------------------------
 
         INSERT INTO #AR059Stage
         (
             FacilityID,
             FacilityName,
+
             InOutType,
             AccountNumber,
 
@@ -554,35 +1053,42 @@ BEGIN
             IPName,
 
             PostingDate,
+
             BillingType,
+
             AdmissionDate,
             DischargeDate,
 
             TransactionCode,
             TransactionDescription,
+
             TransactionAmount,
 
             [Status],
+
             RecoveryTakeback,
+
             DaysFromAdmission,
+
             IncludeExclude,
+
             PriorTransaction
         )
         EXEC RCA_Phys_Code.Analysis.pr_AR059_BadDebtAndInactiveAccountRecoveryPayments
-            @FacilityIDs     = @FacilityIDs,
-            @PeriodID        = @PeriodID,
-            @EndPeriodID     = @EndPeriodID,
-            @InOutTypes      = @InOutTypes,
-            @Username        = @Username,
-            @RAC             = @RAC,
+            @FacilityIDs = @FacilityIDs,
+            @PeriodID = @PeriodID,
+            @EndPeriodID = @EndPeriodID,
+            @InOutTypes = @InOutTypes,
+            @Username = @Username,
+            @RAC = @RAC,
             @ExcludeAccounts = @ExcludeAccounts,
-            @Status          = @Status,
-            @PayorType       = @PayorType,
-            @PayorCodes      = @PayorCodes,
-            @SystemType      = @SystemType,
-            @UDFilter1       = @UDFilter1,
-            @DaysThreshold   = @DaysThreshold,
-            @AuthMode        = @AuthMode;
+            @Status = @Status,
+            @PayorType = @PayorType,
+            @PayorCodes = @PayorCodes,
+            @SystemType = @SystemType,
+            @UDFilter1 = @UDFilter1,
+            @DaysThreshold = @DaysThreshold,
+            @AuthMode = @AuthMode;
 
 
         ----------------------------------------------------
@@ -591,28 +1097,87 @@ BEGIN
 
         SELECT
             @ReturnedRecordCount = COUNT_BIG(1)
+
         FROM #AR059Stage;
 
 
         SELECT
             @IncludeDaysMetCount = COUNT_BIG(1)
+
         FROM #AR059Stage
+
         WHERE IncludeExclude = 'Include Days Met';
 
 
         ----------------------------------------------------
-        -- Save included transaction detail
+        -- Capture included AR059 facilities not found in
+        -- the Report Region mapping.
         ----------------------------------------------------
 
-        INSERT INTO #AR059GroupDetail
+        INSERT INTO #AR059UnmappedFacilities
         (
             RangeOrder,
             RangeLabel,
+
             AnalysisPeriodID,
             ActivityThroughPeriodID,
 
-            GroupCategoryID,
-            GroupCategoryName,
+            FacilityID,
+            FacilityName,
+
+            ReturnedRecordCount
+        )
+        SELECT
+            @RangeOrder,
+            @RangeLabel,
+
+            @PeriodID,
+            @EndPeriodID,
+
+            AR.FacilityID,
+            AR.FacilityName,
+
+            COUNT_BIG(1)
+
+        FROM #AR059Stage AS AR
+
+        LEFT JOIN #PBReportRegionMapping AS RM
+            ON RM.FacilityID = AR.FacilityID
+
+        WHERE AR.IncludeExclude = 'Include Days Met'
+          AND RM.FacilityID IS NULL
+
+        GROUP BY
+            AR.FacilityID,
+            AR.FacilityName;
+
+
+        SELECT
+            @UnmappedDetailCount = COUNT_BIG(1)
+
+        FROM #AR059Stage AS AR
+
+        LEFT JOIN #PBReportRegionMapping AS RM
+            ON RM.FacilityID = AR.FacilityID
+
+        WHERE AR.IncludeExclude = 'Include Days Met'
+          AND RM.FacilityID IS NULL;
+
+
+        ----------------------------------------------------
+        -- Save mapped included transaction detail
+        ----------------------------------------------------
+
+        INSERT INTO #AR059PBDetail
+        (
+            RangeOrder,
+            RangeLabel,
+
+            AnalysisPeriodID,
+            ActivityThroughPeriodID,
+
+            ReportRegionID,
+            ReportRegion,
 
             Specialty,
             AU,
@@ -623,6 +1188,7 @@ BEGIN
 
             FacilityID,
             FacilityName,
+
             InOutType,
             AccountNumber,
 
@@ -636,38 +1202,47 @@ BEGIN
             IPName,
 
             PostingDate,
+
             BillingType,
+
             AdmissionDate,
             DischargeDate,
 
             TransactionCode,
             TransactionDescription,
+
             TransactionAmount,
 
             [Status],
+
             RecoveryTakeback,
+
             DaysFromAdmission,
+
             IncludeExclude,
+
             PriorTransaction
         )
         SELECT
             @RangeOrder,
             @RangeLabel,
+
             @PeriodID,
             @EndPeriodID,
 
-            GM.GroupCategoryID,
-            GM.GroupCategoryName,
+            RM.ReportRegionID,
+            RM.ReportRegion,
 
-            GM.Specialty,
-            GM.AU,
+            RM.Specialty,
+            RM.AU,
 
-            GM.FacilityID,
-            GM.FacilityCode,
-            GM.FacilityName,
+            RM.FacilityID,
+            RM.FacilityCode,
+            RM.FacilityName,
 
             AR.FacilityID,
             AR.FacilityName,
+
             AR.InOutType,
             AR.AccountNumber,
 
@@ -681,28 +1256,36 @@ BEGIN
             AR.IPName,
 
             AR.PostingDate,
+
             AR.BillingType,
+
             AR.AdmissionDate,
             AR.DischargeDate,
 
             AR.TransactionCode,
             AR.TransactionDescription,
+
             AR.TransactionAmount,
 
             AR.[Status],
+
             AR.RecoveryTakeback,
+
             AR.DaysFromAdmission,
+
             AR.IncludeExclude,
+
             AR.PriorTransaction
 
         FROM #AR059Stage AS AR
 
-        INNER JOIN #GroupFacilityMapping AS GM
-            ON GM.FacilityID = AR.FacilityID
+        INNER JOIN #PBReportRegionMapping AS RM
+            ON RM.FacilityID = AR.FacilityID
 
         WHERE AR.IncludeExclude = 'Include Days Met';
 
-        SET @FinalDetailCount = @@ROWCOUNT;
+
+        SET @MappedDetailCount = @@ROWCOUNT;
 
 
         ----------------------------------------------------
@@ -713,18 +1296,24 @@ BEGIN
         (
             RangeOrder,
             RangeLabel,
+
             AnalysisPeriodID,
             ActivityThroughPeriodID,
 
-            GroupCategoryID,
-            GroupCategoryName,
-
+            ReportRegionCount,
+            SpecialtyCount,
             FacilityCount,
+
             ReturnedRecordCount,
+
             IncludeDaysMetCount,
-            FinalDetailCount,
+
+            MappedDetailCount,
+
+            UnmappedDetailCount,
 
             RunStatus,
+
             ErrorNumber,
             ErrorLine,
             ErrorMessage
@@ -733,18 +1322,24 @@ BEGIN
         (
             @RangeOrder,
             @RangeLabel,
+
             @PeriodID,
             @EndPeriodID,
 
-            @GroupCategoryID,
-            @GroupCategoryName,
-
+            @ReportRegionCount,
+            @SpecialtyCount,
             @FacilityCount,
+
             @ReturnedRecordCount,
+
             @IncludeDaysMetCount,
-            @FinalDetailCount,
+
+            @MappedDetailCount,
+
+            @UnmappedDetailCount,
 
             'Completed',
+
             NULL,
             NULL,
             NULL
@@ -762,18 +1357,24 @@ BEGIN
         (
             RangeOrder,
             RangeLabel,
+
             AnalysisPeriodID,
             ActivityThroughPeriodID,
 
-            GroupCategoryID,
-            GroupCategoryName,
-
+            ReportRegionCount,
+            SpecialtyCount,
             FacilityCount,
+
             ReturnedRecordCount,
+
             IncludeDaysMetCount,
-            FinalDetailCount,
+
+            MappedDetailCount,
+
+            UnmappedDetailCount,
 
             RunStatus,
+
             ErrorNumber,
             ErrorLine,
             ErrorMessage
@@ -782,18 +1383,24 @@ BEGIN
         (
             @RangeOrder,
             @RangeLabel,
+
             @PeriodID,
             @EndPeriodID,
 
-            @GroupCategoryID,
-            @GroupCategoryName,
-
+            @ReportRegionCount,
+            @SpecialtyCount,
             @FacilityCount,
-            0,
-            0,
-            0,
+
+            @ReturnedRecordCount,
+
+            @IncludeDaysMetCount,
+
+            @MappedDetailCount,
+
+            @UnmappedDetailCount,
 
             'Error',
+
             ERROR_NUMBER(),
             ERROR_LINE(),
             ERROR_MESSAGE()
@@ -808,19 +1415,18 @@ END;
 
 
 ------------------------------------------------------------
--- 16) SIX-RANGE OVERALL SUMMARY
+-- 25) SIX-RANGE OVERALL PB SUMMARY
 ------------------------------------------------------------
 
 SELECT
     RangeOrder,
     RangeLabel,
+
     AnalysisPeriodID,
     ActivityThroughPeriodID,
 
-    GroupCategoryID,
-    GroupCategoryName,
-
     COUNT_BIG(1) AS TransactionRowCount,
+
     COUNT(DISTINCT AccountNumber) AS DistinctAccountCount,
 
     SUM
@@ -843,36 +1449,37 @@ SELECT
 
     SUM(TransactionAmount) AS NetAmount
 
-FROM #AR059GroupDetail
+FROM #AR059PBDetail
 
 GROUP BY
     RangeOrder,
     RangeLabel,
+
     AnalysisPeriodID,
-    ActivityThroughPeriodID,
-    GroupCategoryID,
-    GroupCategoryName
+    ActivityThroughPeriodID
 
 ORDER BY
     RangeOrder;
 
 
 ------------------------------------------------------------
--- 17) RANGE AND SPECIALTY SUMMARY
+-- 26) RANGE AND REPORT REGION SUMMARY
+--
+-- This is the primary requested Report Region grouping.
 ------------------------------------------------------------
 
 SELECT
     RangeOrder,
     RangeLabel,
+
     AnalysisPeriodID,
     ActivityThroughPeriodID,
 
-    GroupCategoryID,
-    GroupCategoryName,
-
-    Specialty,
+    ReportRegionID,
+    ReportRegion,
 
     COUNT_BIG(1) AS TransactionRowCount,
+
     COUNT(DISTINCT AccountNumber) AS DistinctAccountCount,
 
     SUM
@@ -895,39 +1502,102 @@ SELECT
 
     SUM(TransactionAmount) AS NetAmount
 
-FROM #AR059GroupDetail
+FROM #AR059PBDetail
 
 GROUP BY
     RangeOrder,
     RangeLabel,
+
     AnalysisPeriodID,
     ActivityThroughPeriodID,
-    GroupCategoryID,
-    GroupCategoryName,
-    Specialty
+
+    ReportRegionID,
+    ReportRegion
 
 ORDER BY
     RangeOrder,
-    Specialty;
+    ReportRegion;
 
 
 ------------------------------------------------------------
--- 18) RANGE, SPECIALTY, AND AU SUMMARY
+-- 27) REPORT REGION AND SPECIALTY SUMMARY
 ------------------------------------------------------------
 
 SELECT
     RangeOrder,
     RangeLabel,
+
     AnalysisPeriodID,
     ActivityThroughPeriodID,
 
-    GroupCategoryID,
-    GroupCategoryName,
+    ReportRegionID,
+    ReportRegion,
+
+    Specialty,
+
+    COUNT_BIG(1) AS TransactionRowCount,
+
+    COUNT(DISTINCT AccountNumber) AS DistinctAccountCount,
+
+    SUM
+    (
+        CASE
+            WHEN RecoveryTakeback = 'Net Recovery'
+            THEN TransactionAmount
+            ELSE 0
+        END
+    ) AS NetRecoveryAmount,
+
+    SUM
+    (
+        CASE
+            WHEN RecoveryTakeback = 'Net Takeback'
+            THEN TransactionAmount
+            ELSE 0
+        END
+    ) AS NetTakebackAmount,
+
+    SUM(TransactionAmount) AS NetAmount
+
+FROM #AR059PBDetail
+
+GROUP BY
+    RangeOrder,
+    RangeLabel,
+
+    AnalysisPeriodID,
+    ActivityThroughPeriodID,
+
+    ReportRegionID,
+    ReportRegion,
+
+    Specialty
+
+ORDER BY
+    RangeOrder,
+    ReportRegion,
+    Specialty;
+
+
+------------------------------------------------------------
+-- 28) REPORT REGION, SPECIALTY, AND AU SUMMARY
+------------------------------------------------------------
+
+SELECT
+    RangeOrder,
+    RangeLabel,
+
+    AnalysisPeriodID,
+    ActivityThroughPeriodID,
+
+    ReportRegionID,
+    ReportRegion,
 
     Specialty,
     AU,
 
     COUNT_BIG(1) AS TransactionRowCount,
+
     COUNT(DISTINCT AccountNumber) AS DistinctAccountCount,
 
     SUM
@@ -950,35 +1620,41 @@ SELECT
 
     SUM(TransactionAmount) AS NetAmount
 
-FROM #AR059GroupDetail
+FROM #AR059PBDetail
 
 GROUP BY
     RangeOrder,
     RangeLabel,
+
     AnalysisPeriodID,
     ActivityThroughPeriodID,
-    GroupCategoryID,
-    GroupCategoryName,
+
+    ReportRegionID,
+    ReportRegion,
+
     Specialty,
     AU
 
 ORDER BY
     RangeOrder,
+    ReportRegion,
     Specialty,
     AU;
 
 
 ------------------------------------------------------------
--- 19) FINANCIAL CLASS SUMMARY
+-- 29) REPORT REGION FINANCIAL CLASS SUMMARY
 ------------------------------------------------------------
 
 SELECT
     RangeOrder,
     RangeLabel,
+
     AnalysisPeriodID,
     ActivityThroughPeriodID,
 
-    Specialty,
+    ReportRegionID,
+    ReportRegion,
 
     FCCode AS FinancialClassCode,
     FCName AS FinancialClass,
@@ -986,49 +1662,94 @@ SELECT
     RecoveryTakeback,
 
     COUNT_BIG(1) AS TransactionRowCount,
+
     COUNT(DISTINCT AccountNumber) AS DistinctAccountCount,
+
     SUM(TransactionAmount) AS TotalTransactionAmount
 
-FROM #AR059GroupDetail
+FROM #AR059PBDetail
 
 GROUP BY
     RangeOrder,
     RangeLabel,
+
     AnalysisPeriodID,
     ActivityThroughPeriodID,
-    Specialty,
+
+    ReportRegionID,
+    ReportRegion,
+
     FCCode,
     FCName,
+
     RecoveryTakeback
 
 ORDER BY
     RangeOrder,
-    Specialty,
+    ReportRegion,
     FCName,
     RecoveryTakeback;
 
 
 ------------------------------------------------------------
--- 20) RUN LOG
+-- 30) UNMAPPED AR059 FACILITY DIAGNOSTICS
 --
--- All six ranges should show Completed.
+-- Ideally, this returns no rows.
 ------------------------------------------------------------
 
 SELECT
     RangeOrder,
     RangeLabel,
+
     AnalysisPeriodID,
     ActivityThroughPeriodID,
 
-    GroupCategoryID,
-    GroupCategoryName,
+    FacilityID,
+    FacilityName,
 
+    ReturnedRecordCount
+
+FROM #AR059UnmappedFacilities
+
+ORDER BY
+    RangeOrder,
+    FacilityName,
+    FacilityID;
+
+
+------------------------------------------------------------
+-- 31) RUN LOG
+--
+-- All six ranges should show Completed.
+--
+-- ReconciliationDifference should be zero.
+------------------------------------------------------------
+
+SELECT
+    RangeOrder,
+    RangeLabel,
+
+    AnalysisPeriodID,
+    ActivityThroughPeriodID,
+
+    ReportRegionCount,
+    SpecialtyCount,
     FacilityCount,
+
     ReturnedRecordCount,
+
     IncludeDaysMetCount,
-    FinalDetailCount,
+
+    MappedDetailCount,
+
+    UnmappedDetailCount,
+
+    IncludeDaysMetCount
+        - MappedDetailCount
+        - UnmappedDetailCount AS ReconciliationDifference,
 
     RunStatus,
+
     ErrorNumber,
     ErrorLine,
     ErrorMessage
@@ -1040,19 +1761,23 @@ ORDER BY
 
 
 ------------------------------------------------------------
--- 21) COMPLETE TRANSACTION DETAIL
+-- 32) COMPLETE PB TRANSACTION DETAIL
 --
--- This is the full result to export.
+-- This is the complete result to export.
+--
+-- Report Region is the primary grouping.
+-- Specialty and AU are retained for deeper review.
 ------------------------------------------------------------
 
 SELECT
     RangeOrder,
     RangeLabel,
+
     AnalysisPeriodID,
     ActivityThroughPeriodID,
 
-    GroupCategoryID,
-    GroupCategoryName,
+    ReportRegionID,
+    ReportRegion,
 
     Specialty,
     AU,
@@ -1061,16 +1786,19 @@ SELECT
     MappedFacilityCode,
     MappedFacilityName,
 
-    FacilityID,
-    FacilityName,
+    FacilityID AS AR059FacilityID,
+    FacilityName AS AR059FacilityName,
+
     InOutType,
     AccountNumber,
 
     RecoveryTakeback,
+
     PostingDate,
 
     TransactionCode,
     TransactionDescription,
+
     TransactionAmount,
 
     SIPGCode,
@@ -1083,22 +1811,26 @@ SELECT
     IPName,
 
     BillingType,
+
     AdmissionDate,
     DischargeDate,
 
     [Status],
+
     DaysFromAdmission,
+
     IncludeExclude,
+
     PriorTransaction
 
-FROM #AR059GroupDetail
+FROM #AR059PBDetail
 
 ORDER BY
     RangeOrder,
+    ReportRegion,
     Specialty,
     AU,
-    FacilityName,
+    MappedFacilityName,
     AccountNumber,
     PostingDate,
     TransactionCode;
-
