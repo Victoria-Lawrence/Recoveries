@@ -19,8 +19,7 @@ SET XACT_ABORT ON;
      Financial Class
      Recovery / Takeback
 
- PostingDate cutoff:
-     Includes all transactions posted through 2026-10-21.
+ No separate PostingDate filter is applied.
 ==============================================================*/
 
 ------------------------------------------------------------
@@ -38,9 +37,6 @@ DECLARE @SystemType VARCHAR(MAX) = NULL;
 DECLARE @UDFilter1 VARCHAR(MAX) = NULL;
 DECLARE @DaysThreshold INT = 30;
 DECLARE @AuthMode VARCHAR(10) = 'AD';
-
--- Includes the entire day of October 21, 2026.
-DECLARE @PostingDateCutoff DATE = '20261021';
 
 ------------------------------------------------------------
 -- 2) SIX RECOVERY RANGES
@@ -315,7 +311,6 @@ SELECT
     @RegionCount AS RegionCount,
     @ParentFacilityCount AS ParentFacilityCount,
     @SubFacilityCount AS SubFacilityCount,
-    @PostingDateCutoff AS PostingDateCutoff,
     @FacilityIDs AS SubFacilityIDList;
 
 ------------------------------------------------------------
@@ -353,9 +348,6 @@ CREATE TABLE #AR059Stage
 
 ------------------------------------------------------------
 -- 12) CREATE FINAL HB SUMMARY TABLE
---
--- Range + Parent Facility + IP/OP +
--- Financial Class + Recovery/Takeback
 ------------------------------------------------------------
 
 IF OBJECT_ID('tempdb..#AR059HBSummary') IS NOT NULL
@@ -400,23 +392,20 @@ CREATE TABLE #AR059HBUnmappedFacilities
 -- 14) CREATE RUN LOG
 ------------------------------------------------------------
 
-IF OBJECT_ID('tempdb..#AR059HBPostingRunLog') IS NOT NULL
-    DROP TABLE #AR059HBPostingRunLog;
+IF OBJECT_ID('tempdb..#AR059HBRunLog') IS NOT NULL
+    DROP TABLE #AR059HBRunLog;
 
-CREATE TABLE #AR059HBPostingRunLog
+CREATE TABLE #AR059HBRunLog
 (
     RangeOrder INT,
     RangeLabel VARCHAR(100),
     AnalysisPeriodID INT,
     ActivityThroughPeriodID INT,
-    PostingDateCutoff DATE,
     RegionCount INT,
     ParentFacilityCount INT,
     SubFacilityCount INT,
     ReturnedRecordCount BIGINT,
     IncludeDaysMetCount BIGINT,
-    AfterPostingDateCutoffCount BIGINT,
-    IncludedThroughPostingDateCount BIGINT,
     MappedRecordCount BIGINT,
     UnmappedRecordCount BIGINT,
     RunStatus VARCHAR(20),
@@ -436,8 +425,6 @@ DECLARE @PeriodID INT;
 DECLARE @EndPeriodID INT;
 DECLARE @ReturnedRecordCount BIGINT;
 DECLARE @IncludeDaysMetCount BIGINT;
-DECLARE @AfterPostingDateCutoffCount BIGINT;
-DECLARE @IncludedThroughPostingDateCount BIGINT;
 DECLARE @MappedRecordCount BIGINT;
 DECLARE @UnmappedRecordCount BIGINT;
 
@@ -463,14 +450,12 @@ BEGIN
 
     SET @ReturnedRecordCount = 0;
     SET @IncludeDaysMetCount = 0;
-    SET @AfterPostingDateCutoffCount = 0;
-    SET @IncludedThroughPostingDateCount = 0;
     SET @MappedRecordCount = 0;
     SET @UnmappedRecordCount = 0;
 
     BEGIN TRY
         ----------------------------------------------------
-        -- Run HB AR059
+        -- RUN HB AR059
         ----------------------------------------------------
 
         INSERT INTO #AR059Stage
@@ -515,7 +500,7 @@ BEGIN
             @AuthMode = @AuthMode;
 
         ----------------------------------------------------
-        -- COUNT RETURNED RECORDS
+        -- COUNT RETURNED AND INCLUDED RECORDS
         ----------------------------------------------------
 
         SELECT
@@ -528,36 +513,6 @@ BEGIN
         WHERE IncludeExclude = 'Include Days Met';
 
         ----------------------------------------------------
-        -- COUNT RECORDS AFTER POSTING-DATE CUTOFF
-        ----------------------------------------------------
-
-        SELECT
-            @AfterPostingDateCutoffCount = COUNT_BIG(1)
-        FROM #AR059Stage
-        WHERE IncludeExclude = 'Include Days Met'
-          AND PostingDate >= DATEADD
-          (
-              DAY,
-              1,
-              CAST(@PostingDateCutoff AS DATETIME)
-          );
-
-        ----------------------------------------------------
-        -- COUNT RECORDS THROUGH POSTING-DATE CUTOFF
-        ----------------------------------------------------
-
-        SELECT
-            @IncludedThroughPostingDateCount = COUNT_BIG(1)
-        FROM #AR059Stage
-        WHERE IncludeExclude = 'Include Days Met'
-          AND PostingDate < DATEADD
-          (
-              DAY,
-              1,
-              CAST(@PostingDateCutoff AS DATETIME)
-          );
-
-        ----------------------------------------------------
         -- COUNT MAPPED RECORDS
         ----------------------------------------------------
 
@@ -566,13 +521,7 @@ BEGIN
         FROM #AR059Stage AS AR
         INNER JOIN #HBFacilityMapping AS HM
             ON HM.SubFacilityID = AR.FacilityID
-        WHERE AR.IncludeExclude = 'Include Days Met'
-          AND AR.PostingDate < DATEADD
-          (
-              DAY,
-              1,
-              CAST(@PostingDateCutoff AS DATETIME)
-          );
+        WHERE AR.IncludeExclude = 'Include Days Met';
 
         ----------------------------------------------------
         -- COUNT UNMAPPED RECORDS
@@ -584,12 +533,6 @@ BEGIN
         LEFT JOIN #HBFacilityMapping AS HM
             ON HM.SubFacilityID = AR.FacilityID
         WHERE AR.IncludeExclude = 'Include Days Met'
-          AND AR.PostingDate < DATEADD
-          (
-              DAY,
-              1,
-              CAST(@PostingDateCutoff AS DATETIME)
-          )
           AND HM.SubFacilityID IS NULL;
 
         ----------------------------------------------------
@@ -618,12 +561,6 @@ BEGIN
         LEFT JOIN #HBFacilityMapping AS HM
             ON HM.SubFacilityID = AR.FacilityID
         WHERE AR.IncludeExclude = 'Include Days Met'
-          AND AR.PostingDate < DATEADD
-          (
-              DAY,
-              1,
-              CAST(@PostingDateCutoff AS DATETIME)
-          )
           AND HM.SubFacilityID IS NULL
         GROUP BY
             AR.FacilityID,
@@ -667,12 +604,6 @@ BEGIN
         INNER JOIN #HBFacilityMapping AS HM
             ON HM.SubFacilityID = AR.FacilityID
         WHERE AR.IncludeExclude = 'Include Days Met'
-          AND AR.PostingDate < DATEADD
-          (
-              DAY,
-              1,
-              CAST(@PostingDateCutoff AS DATETIME)
-          )
         GROUP BY
             HM.ParentFacilityID,
             HM.ParentFacility,
@@ -685,20 +616,17 @@ BEGIN
         -- LOG COMPLETED RANGE
         ----------------------------------------------------
 
-        INSERT INTO #AR059HBPostingRunLog
+        INSERT INTO #AR059HBRunLog
         (
             RangeOrder,
             RangeLabel,
             AnalysisPeriodID,
             ActivityThroughPeriodID,
-            PostingDateCutoff,
             RegionCount,
             ParentFacilityCount,
             SubFacilityCount,
             ReturnedRecordCount,
             IncludeDaysMetCount,
-            AfterPostingDateCutoffCount,
-            IncludedThroughPostingDateCount,
             MappedRecordCount,
             UnmappedRecordCount,
             RunStatus,
@@ -712,14 +640,11 @@ BEGIN
             @RangeLabel,
             @PeriodID,
             @EndPeriodID,
-            @PostingDateCutoff,
             @RegionCount,
             @ParentFacilityCount,
             @SubFacilityCount,
             @ReturnedRecordCount,
             @IncludeDaysMetCount,
-            @AfterPostingDateCutoffCount,
-            @IncludedThroughPostingDateCount,
             @MappedRecordCount,
             @UnmappedRecordCount,
             'Completed',
@@ -734,20 +659,17 @@ BEGIN
         -- LOG ERROR AND CONTINUE TO NEXT RANGE
         ----------------------------------------------------
 
-        INSERT INTO #AR059HBPostingRunLog
+        INSERT INTO #AR059HBRunLog
         (
             RangeOrder,
             RangeLabel,
             AnalysisPeriodID,
             ActivityThroughPeriodID,
-            PostingDateCutoff,
             RegionCount,
             ParentFacilityCount,
             SubFacilityCount,
             ReturnedRecordCount,
             IncludeDaysMetCount,
-            AfterPostingDateCutoffCount,
-            IncludedThroughPostingDateCount,
             MappedRecordCount,
             UnmappedRecordCount,
             RunStatus,
@@ -761,14 +683,11 @@ BEGIN
             @RangeLabel,
             @PeriodID,
             @EndPeriodID,
-            @PostingDateCutoff,
             @RegionCount,
             @ParentFacilityCount,
             @SubFacilityCount,
             @ReturnedRecordCount,
             @IncludeDaysMetCount,
-            @AfterPostingDateCutoffCount,
-            @IncludedThroughPostingDateCount,
             @MappedRecordCount,
             @UnmappedRecordCount,
             'Error',
@@ -840,23 +759,20 @@ SELECT
     RangeLabel,
     AnalysisPeriodID,
     ActivityThroughPeriodID,
-    PostingDateCutoff,
     RegionCount,
     ParentFacilityCount,
     SubFacilityCount,
     ReturnedRecordCount,
     IncludeDaysMetCount,
-    AfterPostingDateCutoffCount,
-    IncludedThroughPostingDateCount,
     MappedRecordCount,
     UnmappedRecordCount,
-    IncludedThroughPostingDateCount
+    IncludeDaysMetCount
         - MappedRecordCount
         - UnmappedRecordCount AS ReconciliationDifference,
     RunStatus,
     ErrorNumber,
     ErrorLine,
     ErrorMessage
-FROM #AR059HBPostingRunLog
+FROM #AR059HBRunLog
 ORDER BY
     RangeOrder;
