@@ -1,0 +1,31 @@
+USE [RCA_Phys_Code];
+GO
+SET NOCOUNT ON;
+SET XACT_ABORT ON;
+
+/*==============================================================
+ HTPN WO&M AR059 RECOVERY DETAIL
+ Report Group Selection: GroupCategoryID = 1018
+
+ This version:
+ 1. Uses the HTPN WO&M report-group facility mapping.
+ 2. Retains Specialty and AU from Facility Structure.
+ 3. Runs the existing AR059 procedure for six ranges.
+ 4. Returns summary, diagnostics, and complete detail.
+==============================================================*/
+
+DECLARE @Username VARCHAR(50) = 'BHCS\vstevens';
+DECLARE @GroupCategoryID INT = 1018;
+DECLARE @GroupCategoryName VARCHAR(128);
+
+DECLARE @InOutTypes VARCHAR(20) = 'Outpatient';
+DECLARE @RAC INT = 1;
+DECLARE @ExcludeAccounts INT = 0;
+DECLARE @Status VARCHAR(20) = 'BAD DEBT,INACTIVE';
+DECLARE @PayorType VARCHAR(31) = 'Financial Class';
+DECLARE @PayorCodes VARCHAR(MAX) = NULL;
+
+DECLARE @SystemType VARCHAR(MAX) = NULL;
+DECLARE @UDFilter1 VARCHAR(MAX) = NULL;
+DECLARE @DaysThreshold INT = 30;
+DECLARE @AuthMode VARCHAR(10) = 'AD';
